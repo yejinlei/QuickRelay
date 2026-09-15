@@ -1,0 +1,17 @@
+# Rust
+/target
+Cargo.lock
+
+# IDE
+.idea
+.vscode
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 构建与测试产物
+*.log
+coverage/
+bench-results/
