@@ -1,0 +1,21 @@
+[package]
+name = "quickrelay-binding"
+version = "0.1.0"
+edition = "2021"
+description = "STUN Binding full semantics, ICE candidate attribute validation, and ICE-TCP framing (YEJ-142)"
+license = "MIT"
+
+[dependencies]
+# Deliberately empty. quickrelay-binding is a pure-logic crate with no I/O and
+# no heap allocation on the hot path; see docs/architecture/tech-stack.md §1.1.
+#
+# It is intentionally independent of quickrelay-protocol (YEJ-140) so that the
+# Binding semantics layer can be reviewed and merged without waiting for the
+# message codec. The `binding_response` and `ice_tcp` modules expose
+# integration points (`ResponseSink`, `BindingRequestContext`) that 140/141
+# implement; nothing here parses or serializes STUN wire bytes except the
+# RFC 4571 length framing in `ice_tcp::framing`, which is transport-level and
+# not part of the codec contract.
+
+[dev-dependencies]
+# std only. Tests use std::net for loopback integration coverage.

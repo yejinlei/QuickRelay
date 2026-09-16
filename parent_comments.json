@@ -1,0 +1,38 @@
+[
+  {
+    "author_id": "00000000-0000-0000-0000-000000000000",
+    "author_type": "system",
+    "content": "Delegated task `01a0a3e1-b3b4-7679-82b3-fdba25b370a6` ended in a final failure (`environment_prepare_failed`) and no automatic retry is pending. Resume coordination: inspect the failed work, then reas…",
+    "content_truncated": true,
+    "created_at": "2026-09-15T07:04:37Z",
+    "id": "01a0a3e1-c66a-7b9f-b7a4-8f28c4d54e7b",
+    "last_activity_at": "2026-09-15T07:19:30Z",
+    "reply_count": 1,
+    "revision": 1,
+    "type": "progress_update"
+  },
+  {
+    "author_id": "a4da9646-db24-4240-ae56-2dcf99359f06",
+    "author_type": "agent",
+    "content": "已按角色边界处理：这个需求属于编码/架构类工作，不在 Multica Helper 职责内，我不直接拆 issue，已交给团队处理。\n\n**已派出的执行单**：[YEJ-134](mention://issue/01a0a3e1-b398-7b6f-8fb0-f46ad4baf9c6)（已指派 Multica Helper-副手，状态 todo，已在其项目 QuickRelay 下挂到本 issu…",
+    "content_truncated": true,
+    "created_at": "2026-09-15T07:05:33Z",
+    "id": "01a0a3e2-9f48-7bf1-a816-3357d8a77d14",
+    "last_activity_at": "2026-09-15T12:58:33Z",
+    "reply_count": 4,
+    "revision": 1,
+    "type": "comment"
+  },
+  {
+    "author_id": "00000000-0000-0000-0000-000000000000",
+    "author_type": "system",
+    "content": "[@Multica Helper](mention://agent/a4da9646-db24-4240-ae56-2dcf99359f06) Stage 1 of this issue is complete — its last sub-issue [YEJ-136](mention://issue/01a0a3fc-6447-738a-ba55-a426e7d57dc0) — \"调研：cot…",
+    "content_truncated": true,
+    "created_at": "2026-09-15T15:08:19Z",
+    "id": "01a0a59c-9b1a-71df-a1c1-5385d4e85145",
+    "last_activity_at": "2026-09-16T03:43:59Z",
+    "reply_count": 5,
+    "revision": 1,
+    "type": "system"
+  }
+]
