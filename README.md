@@ -49,15 +49,28 @@
 
 ## 当前状态
 
-仓库已初始化，具体 issue 拆解与实现计划由 Multica 看板管理。技术选型（自研 vs `turn` 库）在 Stage 1 架构设计中定稿。
+Stage 1（架构与调研）已定稿并合入主干，具体 issue 拆解与实现计划由 Multica 看板管理。
 
-## 技术选型（待 Stage 1 定稿）
+- `docs/architecture/tech-stack.md` — 技术选型定稿（协议栈 / I/O / 认证 / 配置 / 可观测性 + 被否决方案）
+- `docs/architecture/protocol-matrix.md` — STUN/TURN 消息类型与 attribute 全量矩阵（RFC 5389 / 8489 / 6051 / 6062 / 5245，含 coturn 默认行为对齐清单）
+- `docs/architecture/architecture.md` — 整体架构：进程线程模型、UDP/Allocate 数据路径、数据结构、内存预算、超时回收、拥塞限速、TLS 组合、REST 端点、issue 依赖图
+- `docs/research/coturn-test-assets.md` — coturn 可复用测试资产清单与 GPL 合规边界
+- `docs/research/performance-baseline.md` — coturn 性能基线与 QuickRelay 性能目标表
+- `docs/project/milestones.md` — 五阶段里程碑、issue 依赖图与风险登记
 
-- 语言：Rust 2021+，稳定版 toolchain
-- 协议：STUN RFC 5389 / 8489、TURN RFC 6051、RFC 6062（ChannelData）、RFC 7635、RFC 8326、ICE RFC 8445
-- 性能对标：coturn 官方 benchmark 数据；本机验收目标见上方「规模与性能指标」
+## 技术选型（Stage 1 已定稿，详见 docs/architecture/tech-stack.md）
+
+- 语言：Rust（edition 2021，stable toolchain）
+- 协议栈：**自研**（仅以 RFC 为行为来源），不采用 `sippusher/turn`（已停更）与 `stun-rs` 系 crate
+- 网络 I/O：数据面 `socket2` + `mio`（每核 `Poll`，`SO_REUSEPORT`），Linux `io_uring` 为可选 feature；控制面 `tokio` 1.x
+- 认证：`hmac` + `sha1` / `sha2`，long-term / ephemeral / 静态分配 key，nonce 含时间戳 + 熵 + salt
+- 配置：`clap` 4.x + `toml` 0.8 + `serde`；REST 动态变更仅本次运行内生效
+- 可观测性：`metrics` + `metrics-exporter-prometheus` + `axum`
+- 协议：STUN RFC 5389 / 8489、TURN RFC 6051、ChannelData RFC 6062、UDP-over-TLS RFC 7635、TLS over TCP RFC 8326、ICE-TCP（见 protocol-matrix.md）
+- 性能对标：coturn 官方数据；本机验收口径为单机 500 路视频 / 2 Gbps 双向 / 分配类 P99 < 1 ms（UDP 路径）
 
 ## 变更记录
 
 - 2026-09-15：录入需求方 5 项拍板结论（仓库地址、500 路 / 2 Gbps、TURN over TLS/TCP、配置模型、licensing）。
 - 2026-09-15：TLS 组合定稿为**全量支持**（UDP-over-TLS / RFC 7635 与 TLS over TCP / RFC 8326 均必须，RFC 6061 仅接收兼容）；补记 REST 鉴权双支持、TLS over TCP 的 P99 < 5 ms 时延口径。
+- 2026-09-16：Stage 1 架构与调研文档（YEJ-136 / 137 / 138 / 139 / 167）合入 `main`。
