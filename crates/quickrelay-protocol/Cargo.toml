@@ -1,0 +1,19 @@
+[package]
+name = "quickrelay-protocol"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "QuickRelay STUN/TURN protocol constants, method codes, attribute registry and message codec (RFC 5389/8489/5766/8656/6062)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+crc32fast = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
+
+[dev-dependencies]
+crc32fast = { workspace = true }

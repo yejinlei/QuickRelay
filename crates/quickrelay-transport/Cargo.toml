@@ -1,0 +1,18 @@
+[package]
+name = "quickrelay-transport"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "QuickRelay UDP/TCP data-plane transport: SO_REUSEPORT per-core workers, fixed-size packet buffers, RFC 8656 TURN-over-TCP framing"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+quickrelay-protocol = { workspace = true }
+socket2 = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
+log = { workspace = true }

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/quickrelay-protocol",
+    "crates/quickrelay-transport",
+    "crates/quickrelay-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["QuickRelay"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/yejinlei/QuickRelay"
+
+[workspace.dependencies]
+quickrelay-protocol = { path = "crates/quickrelay-protocol", version = "0.1.0" }
+quickrelay-transport = { path = "crates/quickrelay-transport", version = "0.1.0" }
+socket2 = { version = "0.5", features = ["all"] }
+hmac = "0.12"
+sha1 = "0.10"
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "macros", "time"] }
+crc32fast = "1.4"

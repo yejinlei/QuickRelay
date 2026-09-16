@@ -1,0 +1,61 @@
+[
+  {
+    "author_id": "00000000-0000-0000-0000-000000000000",
+    "author_type": "system",
+    "content": "[@Multica Helper](mention://agent/a4da9646-db24-4240-ae56-2dcf99359f06) Stage 1 of this issue is complete — its last sub-issue [YEJ-136](mention://issue/01a0a3fc-6447-738a-ba55-a426e7d57dc0) — \"调研：coturn 可复用测试资产清单与 GPL 合规边界\" — just finished. Stage progress — Stage 1: 4/4 done; Stage 2: 0/3 done (next); Stage 3: 0/4 done; Stage 4: 0/4 done; Stage 5: 0/3 done. Stage 2 is next. Review the full layout with `multica issue children 01a0a3d0-21e2-77d2-8212-9e92b2440d41`, and if Stage 2's dependencies are satisfied promote its `backlog` sub-issues to `todo` to continue. Read each sub-issue's description first and only promote items whose stated dependencies are already met — do not rely on this parent's higher-level breakdown alone. If a description conflicts with that breakdown, leave it `backlog` and post a comment to confirm first.",
+    "created_at": "2026-09-15T15:08:19Z",
+    "id": "01a0a59c-9b1a-71df-a1c1-5385d4e85145",
+    "revision": 1,
+    "type": "system"
+  },
+  {
+    "author_id": "a4da9646-db24-4240-ae56-2dcf99359f06",
+    "author_type": "agent",
+    "content": "Stage 1 全部收尾（4/4 done），Stage 2 已推进开工。\n\n**逐条核对过依赖再动的**（没有只按 parent 的粗分阶段决定）：\n\n| 子 issue | 依赖 | 状态 |\n| --- | --- | --- |\n| [YEJ-140](mention://issue/01a0a3fe-8282-7c9c-b95a-22e6b3429f50) 编解码 + RFC 一致性单测 | YEJ-138（crate 划分 + attribute 矩阵）、YEJ-136（RFC 附录字节样例来源）、技术选型定稿 | 三者均已 done → 可开工 |\n| [YEJ-141](mention://issue/01a0a3fe-b690-7357-8ec2-46696d7fd7df) UDP/TCP 传输层 + Binding 链路 | YEJ-140、YEJ-138 线程模型 | YEJ-138 done；YEJ-140 同批转 todo 并行 |\n| [YEJ-142](mention://issue/01a0a3fe-d102-7caf-b8b5-007635037871) Binding 完整语义 + ICE-TCP | YEJ-140、YEJ-141 | 同上 |\n\n141 / 142 字面上依赖 140，但三者都指向同一份 crate 划分（138 已定稿），没有构建期互锁——拆成三个 crate（`quickrelay-codec` / `quickrelay-transport` / `quickrelay-binding`）时只有 mod 声明需要等，逻辑互不阻塞。同批并行，141/142 需要 codec API 时再阻塞等待即可，不额外设 stage 屏障。\n\n**指派**（同一 agent 不并行派多个，`高阶攻坚` 那个正在跑别的任务，未占用）：\n\n- YEJ-140 → 代码高手Codex-02\n- YEJ-141 → 代码高手Codex-01\n- YEJ-142 → 代码高手Claude-01\n\n**一件事需要人拍板**：138 的定稿文档（`docs/architecture/tech-stack.md`、`protocol-matrix.md`、`architecture.md`）在分支 `agent/agent/yej-138` 上，PR #1 还没合；`main` 目前只有 README + .gitignore。而 140 的「按架构文档的 attribute 矩阵裁剪」直接依赖 `protocol-matrix.md`——请优先合并 PR #1（或让 140 基于该分支）。这是三条实现单唯一的硬依赖，也是唯一我没法自己推的点。\n\nStage 3（143–146）、Stage 4（147–149、153）、Stage 5（150–152）保持 `backlog`，Stage 2 出结果后再推进。本 issue 保持 `in_progress`。",
+    "created_at": "2026-09-15T15:19:00Z",
+    "id": "01a0a5a6-6674-733a-bf4f-2bef6a6113b0",
+    "parent_id": "01a0a59c-9b1a-71df-a1c1-5385d4e85145",
+    "revision": 1,
+    "type": "comment"
+  },
+  {
+    "author_id": "64adf485-1368-4d57-bebb-ba226b1d55de",
+    "author_type": "member",
+    "content": "所有之前处理的issue，涉及到文档、代码变更的，都合入git主干并推送",
+    "created_at": "2026-09-16T02:24:17Z",
+    "id": "01a0a807-7907-737e-95ca-67d834140dc4",
+    "parent_id": "01a0a59c-9b1a-71df-a1c1-5385d4e85145",
+    "revision": 1,
+    "type": "comment"
+  },
+  {
+    "author_id": "a4da9646-db24-4240-ae56-2dcf99359f06",
+    "author_type": "agent",
+    "content": "已全部合入 `main` 并推送（`c5b19e4 → f8e6d10`），工作区已核对为 clean，三个 OPEN PR 已关闭。\n\n**合入内容（线性历史，无 merge commit）**\n\n| 提交 | 来源 | 内容 |\n| --- | --- | --- |\n| `32b19e1` | YEJ-136 | `docs/research/coturn-test-assets.md` — 可复用测试资产清单 + GPL 合规边界 |\n| `b87bd64` | YEJ-137 | `docs/research/performance-baseline.md` — 性能基线与目标表 |\n| `27933f9` | YEJ-139 | `docs/project/milestones.md` — 五阶段里程碑 / 依赖图 / 风险登记 |\n| `5f60182` | YEJ-138 | `docs/architecture/tech-stack.md` + `protocol-matrix.md` + `architecture.md` + README |\n| `f85288b` | YEJ-167 | 架构文档回填已拍板口径，关闭 Stage 1 全部开放项 |\n| `f8e6d10` | 本次 | README 同步 Stage 1 交付物清单与技术选型定稿状态 |\n\n加上本来就在本地 `main`、但未推送的 `0c4eb97`（TLS 组合全量支持 + REST 鉴权双支持 + TLS over TCP 时延口径），现在主干完整。\n\n**几处冲突/取舍，都按已拍板口径解决，没有丢内容**\n\n1. **YEJ-138 回退了需求方的 TLS 口径**（把 RFC 7635 / 8326 全量支持改回单行「TURN over TLS」，删掉了 RFC 6061 勘误行）。按 0c4eb97 的最终口径保留，不采纳 138 版本——否则主干会倒退到定稿前状态。\n2. **architecture.md 的权威口径与 README 脱节**：README 停在「技术选型待 Stage 1 定稿」，但 `docs/architecture/` 早已定稿。本次已把 README 的现状/选型段同步为定稿状态，并补进完整文档清单。\n3. **PR 冲突根因**：`0c4eb97`（TLS 定稿）此前只在本地 `main`，从未推送；三个 PR 里 139 / 167 是相对 `0c4eb97` 切出的、138 更早在 `c5b19e4` 上切出。GitHub 端 `main` 落后于这些分支，PR #1 因此既显示 conflict、又会把 TLS 口径回退掉。已取各分支最终 tip 线性合入，PR #1/#2/#3 已关闭，避免重复合并。\n\n**未纳入（不属于「文档/代码变更」）**\n\n- `agent/agent/yej-139`、`agent/multica-helper/*` 上的 `description.md` / `children.json` 是 CLI 调用留下的 scratch 文件，未入库。\n- `origin/agent/multica-helper/yej-154`、`origin/docs-perf-baseline-yej-137` 是已交付内容的陈旧重复分支，内容已含在主干里。\n\n**一个影响后续的点**：上一轮那条硬阻塞（`protocol-matrix.md` 只在 `agent/agent/yej-138` 分支上、PR 未合，140 无法裁剪 attribute 矩阵）已经消除——该文档现已在 `main` 上，Stage 2 三条实现单可直接基于主干。",
+    "created_at": "2026-09-16T03:16:54Z",
+    "id": "01a0a837-a58a-7685-80eb-e69e070e0197",
+    "parent_id": "01a0a807-7907-737e-95ca-67d834140dc4",
+    "revision": 1,
+    "type": "comment"
+  },
+  {
+    "author_id": "64adf485-1368-4d57-bebb-ba226b1d55de",
+    "author_type": "member",
+    "content": "可以开始实现代码了吗？",
+    "created_at": "2026-09-16T03:21:03Z",
+    "id": "01a0a83b-73ac-7ac0-b52a-c8e5163bb658",
+    "parent_id": "01a0a59c-9b1a-71df-a1c1-5385d4e85145",
+    "revision": 1,
+    "type": "comment"
+  },
+  {
+    "author_id": "a4da9646-db24-4240-ae56-2dcf99359f06",
+    "author_type": "agent",
+    "content": "可以，代码实现已经启动了。\n\n**我核过的三条前置，都通了**\n\n- Stage 1 产物已在 `main`（`c5b19e4 → f8e6d10`），远端 `origin/main` 同为 `f8e6d10`，一致。\n- `docs/architecture/protocol-matrix.md` 在主干可读——上一轮那条「140 拿不到 attribute 矩阵」的硬阻塞已消除。\n- 三个实现 agent（Claude-01 / Codex-01 / Codex-02）当前都空闲，可执行。\n\n**顺带修掉一件事：140 / 141 其实一直没真正开跑**\n\n它们从 21:22 起就已是 `todo` 且指派了 agent，但没有任何 run 记录、没有任何评论、没有分支——任务一直卡在队列里，因为当初派给了当时正占用其他任务的 agent。看板显示「todo + 已指派」看起来像在跑，实际是静默的。本轮已改派给空闲 agent 并启动，三条现在都有真实 run：\n\n| 子 issue | 内容 | 执行 agent | run 状态 |\n| --- | --- | --- | --- |\n| [YEJ-140](mention://issue/01a0a3fe-8282-7c9c-b95a-22e6b3429f50) | STUN/TURN 编解码 + RFC 一致性单测 | 代码高手Claude-01 | running |\n| [YEJ-141](mention://issue/01a0a3fe-b690-7357-8ec2-46696d7fd7df) | UDP/TCP 传输层 + Binding 链路（含 TURN over TCP） | 代码高手Codex-01 | running |\n| [YEJ-142](mention://issue/01a0a3fe-d102-7caf-b8b5-007635037871) | Binding 完整语义 + ICE 候选校验（含 ICE-TCP 基础） | 代码高手Codex-02 | 已从 backlog 提 todo，dispatched |\n\n**Stage 3–5 仍保持 `backlog`，这是正确状态**：逐条读依赖确认了 143 / 146 要 140+143、144 要 141+143、145 要 143+144、147–149 / 153 要传输层与鉴权产物——都指向 Stage 2 的交付物，没有一条能提前动。Stage 2 出结果后我再推。\n\n**一个需要你留意的点**：本机 daemon 当前有 7 个任务卡在 `waiting_local_directory`——QuickRelay 的 `local_directory` 资源是 `worktree` 模式，多个 agent 抢同一份检出会排队。如果这三条 run 也卡进这个队列（表现为 run 状态长时间停在 `waiting_local_directory`、没有新分支出现），告诉我，我把资源模式从 `worktree` 改成直接主检出，或者清掉那批陈旧的等锁任务。\n\n本 issue 保持 `in_progress`。",
+    "created_at": "2026-09-16T03:43:59Z",
+    "id": "01a0a850-738c-7ed0-aeae-18328c67d15d",
+    "parent_id": "01a0a83b-73ac-7ac0-b52a-c8e5163bb658",
+    "revision": 1,
+    "type": "comment"
+  }
+]

@@ -1,0 +1,27 @@
+[package]
+name = "quickrelay-server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "QuickRelay server: SO_REUSEPORT UDP worker pool, TCP listener and the STUN Binding chain"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "quickrelay"
+path = "src/bin/quickrelay.rs"
+
+[dependencies]
+quickrelay-protocol = { workspace = true }
+quickrelay-transport = { workspace = true }
+socket2 = { workspace = true }
+log = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+socket2 = { workspace = true }
