@@ -189,3 +189,21 @@ Message Integrity 与 Fingerprint 的相对位置规则是硬约束：
 4. 服务端在计算 HMAC 时，必须**临时清零** `MESSAGE-INTEGRITY` 与 `FINGERPRINT` 的长度字段再计算，且计算的是清零后的字节流。
 
 本设计的编解码器在写入路径上必须固化上述顺序，测试用例需断言字节序列。
+
+---
+
+## 7. 与 TLS 组合 / REST 口径的一致性复查（v2，[YEJ-167]）
+
+本节是本矩阵与已确认口径的逐节对照结论，实现 issue 若发现不一致以本节为准并回填：
+
+| 项 | 口径 | 本矩阵中的落点 |
+| --- | --- | --- |
+| **UDP-over-TLS / RFC 7635** | **必须**（WebRTC 客户端唯一实际使用的 TURN over TLS 路径，对齐 coturn `--use-tls`） | §5 的 `--use-tls` 行 |
+| **TLS over TCP / RFC 8326** | **必须** | §5 的 `--use-tls` + TCP 行 |
+| **RFC 6061（TURN over TLS over UDP）** | **仅接收兼容**，不作为主路径；已被 RFC 9263 标记 obsoleted | 架构文档 §0.1 勘误、§8.1 |
+| **TURN over TCP（明文）** | **必须** | §1 的 `0x0008` / `0x0009` / `0x0014`（Send Request / Data Indication / Send Indication） |
+| **ICE-TCP 协商** | **必须** | §1 / §3 的完整 attribute 支持面 |
+| **REST 双鉴权头名** | Bearer token = `Authorization: Bearer <token>`；HMAC 签名 = `X-QuickRelay-Date` + `X-QuickRelay-Signature`；可各自开关、可同时启用，同时启用时 **Bearer 优先** | 架构文档 §9.5 |
+| **REST HTTP 错误码** | `401` / `403` / `400` / `404` / `409`（含凭证类键 DELETE 与需重启项） | 架构文档 §9.5 |
+
+**错误码命名空间区分（防止混淆）**：本矩阵 §4 的 `401` / `437` / `487` / `508` 等是 **TURN / STUN 协议错误码**（`ERROR-CODE` attribute，RFC 6051 §12 + RFC 5389 §13.21），出现在 STUN/TURN 消息体内；架构文档 §9.5 的 `401` / `403` / `409` 等是 **REST 端点的 HTTP 状态码**。两者编号相同但**不属于同一命名空间**，测试断言必须明确是哪种（协议码断言 `ERROR-CODE` 属性值，HTTP 码断言响应状态行）。
