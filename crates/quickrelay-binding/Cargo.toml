@@ -7,15 +7,18 @@ license = "MIT"
 
 [dependencies]
 # Deliberately empty. quickrelay-binding is a pure-logic crate with no I/O and
-# no heap allocation on the hot path; see docs/architecture/tech-stack.md §1.1.
+# no allocation on the hot path (see docs/architecture/tech-stack.md §1.1).
 #
-# It is intentionally independent of quickrelay-protocol (YEJ-140) so that the
-# Binding semantics layer can be reviewed and merged without waiting for the
-# message codec. The `binding_response` and `ice_tcp` modules expose
-# integration points (`ResponseSink`, `BindingRequestContext`) that 140/141
-# implement; nothing here parses or serializes STUN wire bytes except the
-# RFC 4571 length framing in `ice_tcp::framing`, which is transport-level and
-# not part of the codec contract.
+# It is intentionally independent of quickrelay-protocol (YEJ-140): the message
+# codec is owned by that issue, and every input here is a plain value (flags,
+# endpoints, tiebreaker), not a parsed STUN message. When 140 lands, the
+# integration work is to map codec attributes onto `RequestFlags` /
+# `IceRole` and to render `ResponseAttribute` into bytes in that order —
+# no change to this crate's decisions is required.
+#
+# The RFC 4571 length framing in `ice_tcp` is the WebRTC ICE-TCP path, not a
+# codec contract; RFC 6062's TURN-over-TCP control connection does not use it
+# (see `ice_tcp` module docs).
 
 [dev-dependencies]
-# std only. Tests use std::net for loopback integration coverage.
+socket2 = { version = "0.5", features = ["all"] }
