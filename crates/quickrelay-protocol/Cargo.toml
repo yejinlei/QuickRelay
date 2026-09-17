@@ -1,19 +1,27 @@
 [package]
 name = "quickrelay-protocol"
+description = "STUN/TURN message and attribute codec for QuickRelay (RFC 5389 / 8489 / 6051 / 6062 / 6061 / 8326 / 8445)"
+authors = ["yejinlei"]
+
 version.workspace = true
-authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "QuickRelay STUN/TURN protocol constants, method codes, attribute registry and message codec (RFC 5389/8489/5766/8656/6062)"
-
-[lib]
-path = "src/lib.rs"
 
 [dependencies]
-crc32fast = { workspace = true }
-hmac = { workspace = true }
-sha1 = { workspace = true }
+bytes.workspace = true
+crc32fast.workspace = true
+hmac.workspace = true
+md5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 
-[dev-dependencies]
-crc32fast = { workspace = true }
+[features]
+default = []
+# Enables `TransactionId::random()` via a process RNG.
+rand = ["dep:rand"]
+
+[dependencies.rand]
+version = "0.9"
+optional = true

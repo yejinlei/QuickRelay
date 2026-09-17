@@ -8,20 +8,35 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-authors = ["QuickRelay"]
+authors = ["yejinlei"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yejinlei/QuickRelay"
 
 [workspace.dependencies]
+# --- quickrelay-protocol (YEJ-140, F0 frozen) ---
+bytes = "1"
+crc32fast = "1"
+hmac = "0.12"
+md5 = "0.7"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2"
+rand = "0.9"
+
+# --- quickrelay-transport (YEJ-141) ---
+socket2 = "0.5"
+mio = "1"
+log = "0.4"
+clap = { version = "4", features = ["derive"] }
+
+# --- quickrelay-transport (YEJ-141) ---
 quickrelay-protocol = { path = "crates/quickrelay-protocol", version = "0.1.0" }
 quickrelay-transport = { path = "crates/quickrelay-transport", version = "0.1.0" }
-socket2 = { version = "0.5", features = ["all"] }
-hmac = "0.12"
-sha1 = "0.10"
-log = "0.4"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt", "net", "sync", "macros", "time"] }
-crc32fast = "1.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
