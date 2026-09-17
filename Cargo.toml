@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/yejinlei/QuickRelay"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# HTTP control plane (docs/architecture/tech-stack.md line 78)
+axum = "0.7"
+bytes = "1"
+tower = { version = "0.5", features = ["util"] }
+
+# Authentication primitives (tech-stack.md line 128: hmac + sha1/sha2, constant-time)
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2"
+
+# Configuration & CLI (tech-stack.md lines 71, 143-144)
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Time, logging, runtime
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+parking_lot = "0.12"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Observability (tech-stack.md line 169)
+metrics = "0.23"
+metrics-exporter-prometheus = "0.16"

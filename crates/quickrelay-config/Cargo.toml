@@ -1,0 +1,31 @@
+[package]
+name = "quickrelay-config"
+version = "0.1.0"
+edition = "2021"
+description = "QuickRelay runtime (REST) configuration change surface: in-memory overrides only, never persisted"
+license = "Apache-2.0"
+repository = "https://github.com/yejinlei/QuickRelay"
+rust-version = "1.75"
+
+[dependencies]
+axum = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tower = { version = "0.5", features = ["util", "timeout"] }
+
+[features]
+# TLS wrapping of the REST listener (`--rest-tls`) is optional and default off.
+# The listener is bound on this crate's build side; enabling the feature adds a
+# TLS handshake in front of the same axum router.
+default = []
+rest-tls = []
