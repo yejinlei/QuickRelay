@@ -1,0 +1,32 @@
+[package]
+name = "quickrelay-protocol"
+description = "STUN/TURN message and attribute codec for QuickRelay (RFC 5389 / 8489 / 8656 / 6051 / 6062 / 7635 / 8326 / 8445)"
+readme = "README.md"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# No I/O, no threads, no allocator on the read path, no tokio/mio/socket2/log.
+# Adding any dependency here requires an architecture approval (workspace-layout §2.1).
+[dependencies]
+bytes.workspace = true
+crc32fast.workspace = true
+hmac.workspace = true
+md5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+
+[features]
+default = []
+# Enables `TransactionId::random()` via a process RNG.
+rand = ["dep:rand"]
+
+[dependencies.rand]
+version = "0.9"
+optional = true
+
+[dev-dependencies]

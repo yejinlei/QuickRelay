@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/quickrelay-protocol",
+    "crates/quickrelay-binding",
+    "crates/quickrelay-transport",
+    "crates/quickrelay-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["yejinlei"]
+repository = "https://github.com/yejinlei/QuickRelay"
+
+# ---------------------------------------------------------------------------
+# Workspace dependencies.
+#
+# RULE (docs/architecture/workspace-layout.md §6): adding a new entry is
+# allowed by any issue, but only by APPENDING here. Never rewrite an existing
+# line's version. Cargo ignores workspace deps that no member references, so
+# unused entries are harmless.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+
+# --- quickrelay-protocol (STUN/TURN codec, RFC 8489 / 8656 / 7635) ---------
+bytes = "1"
+crc32fast = "1"
+hmac = "0.12"
+md5 = "0.7"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2"
+
+# --- quickrelay-transport (SO_REUSEPORT workers, framing, TLS) -------------
+socket2 = { version = "0.5", features = ["all"] }
+mio = "1"
+# Linux only, behind the `transport-uring` feature (see tech-stack.md §2).
+io-uring = "0.7"
+
+# --- quickrelay-server (assembly, CLI, config) -----------------------------
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- control plane / management (Stage 4) ----------------------------------
+# Control plane runs on tokio; the UDP/TCP data plane does NOT (tech-stack §2).
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "signal"] }
+axum = "0.7"
+tower = "0.5"
+
+# --- TLS (Stage 4, RFC 8326 / RFC 7635) -----------------------------------
+rustls = "0.23"
+
+# --- quickrelay crates -----------------------------------------------------
+quickrelay-protocol = { path = "crates/quickrelay-protocol", version = "0.1.0" }
+quickrelay-binding = { path = "crates/quickrelay-binding", version = "0.1.0" }
+quickrelay-transport = { path = "crates/quickrelay-transport", version = "0.1.0" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+[profile.bench]
+inherits = "release"
+debug = true

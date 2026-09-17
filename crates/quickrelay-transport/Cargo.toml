@@ -1,0 +1,20 @@
+[package]
+name = "quickrelay-transport"
+description = "QuickRelay data-plane transport: SO_REUSEPORT per-core workers, UDP send/recv, TCP listener, and the 16-bit length-prefix framing shared by TURN over TCP and ICE-TCP"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Dependencies are limited to socket2, mio, bytes, log (plus rustls / io-uring
+# in later stages). quickrelay-protocol is allowed; quickrelay-binding is NOT.
+# See docs/architecture/workspace-layout.md section 2.3.
+[dependencies]
+socket2 = { workspace = true }
+mio = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+quickrelay-protocol = { workspace = true }

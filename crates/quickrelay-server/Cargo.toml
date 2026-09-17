@@ -1,0 +1,27 @@
+[package]
+name = "quickrelay-server"
+description = "QuickRelay assembly crate: worker startup, BindingHandler wiring, signal handling, CLI and config parsing. Produces the quickrelay binary."
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "quickrelay"
+path = "src/main.rs"
+
+# `features = ["rand"]` is required for `TransactionId::random()`.
+# `quickrelay-protocol` is read-only here: no re-export, no shim, no fork.
+[dependencies]
+quickrelay-protocol = { workspace = true, features = ["rand"] }
+quickrelay-binding = { workspace = true }
+quickrelay-transport = { workspace = true }
+socket2 = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

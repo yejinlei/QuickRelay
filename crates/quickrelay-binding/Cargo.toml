@@ -1,0 +1,26 @@
+[package]
+name = "quickrelay-binding"
+description = "STUN Binding semantics: CHANGE-REQUEST resolution, ICE attribute validation, role-conflict and error-code decisions. Pure logic, no I/O."
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# NO DEPENDENCIES.
+#
+# `quickrelay-binding` must not depend on `quickrelay-protocol`: every input is
+# a plain value type defined in this crate, and `quickrelay-server` does the
+# two-way mapping (see docs/architecture/workspace-layout.md §3.2).
+#
+# `quickrelay-binding` must not depend on anything that touches a socket.
+# ICE-TCP framing (RFC 4571 / RFC 6544 / RFC 6062) is owned by
+# `quickrelay-transport`; this crate decides *what to answer*, never *how a
+# packet arrives*.
+
+[dependencies]
+
+[dev-dependencies]
+# For loopback integration tests only. Not a production dependency.
+socket2 = { workspace = true }

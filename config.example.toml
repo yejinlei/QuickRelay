@@ -1,0 +1,24 @@
+# QuickRelay configuration example.
+#
+# SKELETON: only the shape is fixed here. The full parameter set is decided by
+# YEJ-147 (Stage 4). See docs/architecture/architecture.md for the design of
+# each parameter and docs/architecture/workspace-layout.md for crate ownership.
+#
+# Static configuration (requires a restart) and runtime-changeable
+# configuration are two separate sets; the runtime set is served by the REST
+# endpoints described in architecture.md section 9.
+
+# [server]
+# listening-ip = []
+# listening-port = 3478
+# num-workers = 0          # 0 = one worker per physical core
+# udp-rbuf-size = 4194304  # per-worker SO_RCVBUF
+
+# [tls]
+# tls-listening-port = 5349
+
+# [auth]
+# realm = "quickrelay"
+
+# [rest]
+# bind-addr = "127.0.0.1:8081"
