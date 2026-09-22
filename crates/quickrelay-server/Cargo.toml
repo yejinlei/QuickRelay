@@ -21,6 +21,8 @@ path = "src/main.rs"
 quickrelay-protocol = { workspace = true, features = ["rand"] }
 quickrelay-binding = { workspace = true }
 quickrelay-transport = { workspace = true }
+# The same socket types the handler clones from the worker.
+mio = { workspace = true, features = ["net"] }
 socket2 = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
