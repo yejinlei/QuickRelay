@@ -26,3 +26,14 @@ pub use change_request::{ChangeRequest, ChangeResponseAction};
 pub use error_codes::{ErrorCode, ReasonPhrase};
 pub use ice::{IceAttributes, IceRole, IceTiebreaker};
 pub use response::{BindingResponsePlan, ResponseSink, ServerIdentity};
+
+// ---------------------------------------------------------------------------
+// YEJ-142 additions: appended after the frozen block.
+// ---------------------------------------------------------------------------
+
+/// The request-facts to plan decision table.
+pub mod decision;
+
+pub use decision::{BindingRequestFacts, NOT_COMPREHENSION_REQUIRED, decide};
+pub use ice::{IceValidation, IpFamily, OtherAddress};
+pub use response::{ChangeSource, Outcome};

@@ -6,7 +6,53 @@
 //! out of scope.
 //!
 //! Attribute codes (IANA, 2024-12-20): ICE-CONTROLLED `0x8029`,
-//! ICE-CONTROLLING `0x802A`, ICE-PRIORITY `0x0024`.
+//! ICE-CONTROLLING `0x802A`, ICE-PRIORITY `0x0024`, OTHER-ADDRESS `0x802C`.
+//!
+//! # What this module decides
+//!
+//! ICE-CONTROLLED and ICE-CONTROLLING are mutually exclusive, and each one
+//! carries the peer's 64-bit tiebreaker. QuickRelay is not an ICE endpoint, so
+//! it never claims a role of its own and has no tiebreaker to compare against:
+//! the conflict is decided from the request alone.
+//!
+//! * Both attributes present -- the peer claims two roles at once, a role
+//!   conflict ([`ErrorCode::RoleConflict`], 487).
+//! * One present without a tiebreaker -- the attribute is only well formed
+//!   with it, so 400 Bad Request.
+//! * Neither present, or exactly one with a tiebreaker -- acceptable.
+//! * `ICE-PRIORITY` present -- it belongs on a candidate-check, not on a
+//!   `Binding` request: 388 Unknown Attribute.
+//! * `OTHER-ADDRESS` naming a family different from the one this connection
+//!   actually uses -- the request does not describe the connection it is on:
+//!   400 Bad Request, checked by [`validate_other_address`].
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use crate::ErrorCode;
+
+/// The address family of a socket address, as the server sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpFamily {
+    /// IPv4 (RFC 8445 Section 4.1.1.1, family `0x01`).
+    V4,
+    /// IPv6 (family `0x02`).
+    V6,
+}
+
+impl IpFamily {
+    /// The address-family field `OTHER-ADDRESS` carries.
+    pub const fn code(self) -> u8 {
+        match self {
+            IpFamily::V4 => 0x01,
+            IpFamily::V6 => 0x02,
+        }
+    }
+
+    /// Whether `other` is a different address family from `self`.
+    pub fn differs_from(self, other: IpFamily) -> bool {
+        self != other
+    }
+}
 
 /// Which ICE role the peer claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -22,13 +68,27 @@ pub enum IceRole {
     Conflict,
 }
 
+impl IceRole {
+    /// Combine the two presence bits into a role. A request carrying both
+    /// `ICE-CONTROLLED` and `ICE-CONTROLLING` is always a conflict, whatever
+    /// the tiebreakers say.
+    pub fn from_presence(controlled: bool, controlling: bool) -> Self {
+        match (controlled, controlling) {
+            (true, true) => IceRole::Conflict,
+            (true, false) => IceRole::Controlled,
+            (false, true) => IceRole::Controlling,
+            (false, false) => IceRole::None,
+        }
+    }
+}
+
 /// The 64-bit tiebreaker carried in ICE-CONTROLLED / ICE-CONTROLLING.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct IceTiebreaker(pub u64);
 
 impl IceTiebreaker {
     /// Decode from the 8-octet attribute value, big-endian.
-    pub const fn from_bytes(bytes: [u8; 8]) -> Self {
+    pub fn from_bytes(bytes: [u8; 8]) -> Self {
         IceTiebreaker(u64::from_be_bytes(bytes))
     }
 
@@ -49,4 +109,375 @@ pub struct IceAttributes {
     pub priority: Option<u32>,
     /// USE-CANDIDATE was present (RFC 8445 Section 6.1.2).
     pub use_candidate: bool,
+}
+
+impl IceAttributes {
+    /// A role attribute without a tiebreaker is not well formed (400).
+    pub const fn is_role_malformed(self) -> bool {
+        (matches!(self.role, IceRole::Controlled | IceRole::Controlling))
+            && self.tiebreaker.is_none()
+    }
+}
+
+/// The `OTHER-ADDRESS` value: the peer's address as it knows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OtherAddress {
+    /// The family of `address`.
+    pub family: IpFamily,
+    /// The address octets, 16 wide and zero-padded for IPv4.
+    pub address: [u8; 16],
+}
+
+/// Read `OTHER-ADDRESS` from its 16-octet attribute body: the 8-octet address,
+/// then a family code, then 7 reserved octets. Returns `None` when the family
+/// code is not `0x01` or `0x02`.
+///
+/// Kept a free function rather than a field of [`IceAttributes`] so that
+/// `quickrelay-server` can decide, per message, whether to pass the value
+/// through; the attribute is optional.
+pub fn other_address_from_bytes(bytes: [u8; 16]) -> Option<OtherAddress> {
+    let family = match bytes[8] {
+        0x01 => IpFamily::V4,
+        0x02 => IpFamily::V6,
+        _ => return None,
+    };
+    let mut address = [0u8; 16];
+    address[..8].copy_from_slice(&bytes[..8]);
+    // The IPv4 form places the address in the low 32 bits of the
+    // 64-bit field, so it lands in the low 32 bits of the 16-octet
+    // carrier as well. `other_address_to_ip_addr` reads it back from there.
+    if family == IpFamily::V4 {
+        address[12..].copy_from_slice(&bytes[4..8]);
+    }
+    Some(OtherAddress { family, address })
+}
+
+/// Put an `OTHER-ADDRESS` value back into its 16-octet carrier.
+pub fn other_address_to_bytes(other: OtherAddress) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    if other.family == IpFamily::V4 {
+        bytes[4..8].copy_from_slice(&other.address[12..16]);
+    } else {
+        bytes[..8].copy_from_slice(&other.address[..8]);
+    }
+    bytes[8] = other.family.code();
+    bytes
+}
+
+/// The address in `other` as an [`IpAddr`], respecting its family.
+pub fn other_address_to_ip_addr(other: OtherAddress) -> Option<IpAddr> {
+    match other.family {
+        IpFamily::V4 => Some(IpAddr::from(Ipv4Addr::from([
+            other.address[12],
+            other.address[13],
+            other.address[14],
+            other.address[15],
+        ]))),
+        IpFamily::V6 => Some(IpAddr::V6(Ipv6Addr::from(other.address))),
+    }
+}
+
+/// The outcome of validating a peer's ICE attribute set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IceValidation {
+    /// The attributes are well formed; the reply may proceed.
+    Ok,
+    /// The peer claims both roles at once, so the server cannot answer it
+    /// without telling it which one to take (RFC 8445 Section 7.2.1.1).
+    RoleConflict,
+    /// Both role attributes are present at once: always malformed.
+    Conflict,
+    /// `OTHER-ADDRESS` names a family different from the one this connection
+    /// actually uses: the request does not describe the connection it is on, so
+    /// it is not well formed. See [`validate_other_address`].
+    WrongFamily,
+    /// A role attribute is present without a tiebreaker.
+    Malformed,
+    /// `ICE-PRIORITY` was present on a `Binding` request, where it belongs on
+    /// a candidate-check only.
+    UnknownAttribute,
+}
+
+impl IceValidation {
+    /// The error code to emit, or `None` when the validation passed.
+    pub fn error(self) -> Option<ErrorCode> {
+        match self {
+            IceValidation::Ok => None,
+            IceValidation::RoleConflict | IceValidation::Conflict => Some(ErrorCode::RoleConflict),
+            IceValidation::WrongFamily => Some(ErrorCode::BadRequest),
+            IceValidation::Malformed => Some(ErrorCode::BadRequest),
+            IceValidation::UnknownAttribute => Some(ErrorCode::UnknownAttribute),
+        }
+    }
+}
+
+/// The ICE role conflict check (RFC 8445 Section 7.2.1.1).
+///
+/// `peer_role` is the role the peer claims for itself in the request;
+/// `peer_tiebreaker` its tiebreaker.
+///
+/// `local_role` and `local_tiebreaker` are the role the local side would take
+/// on this connection, if any. QuickRelay never does: it is a STUN server, not
+/// an ICE endpoint, so the server always passes `None` and the check reduces to
+/// the peer's own request being well formed.
+pub fn role_conflict(
+    peer_role: IceRole,
+    peer_tiebreaker: Option<IceTiebreaker>,
+    local_role: Option<IceRole>,
+    local_tiebreaker: Option<IceTiebreaker>,
+) -> IceValidation {
+    if matches!(peer_role, IceRole::Conflict) {
+        return IceValidation::Conflict;
+    }
+    if matches!(peer_role, IceRole::Controlled | IceRole::Controlling) && peer_tiebreaker.is_none()
+    {
+        return IceValidation::Malformed;
+    }
+    let Some(local) = local_role else {
+        // The server has no role of its own: there is nothing to conflict with.
+        return IceValidation::Ok;
+    };
+    if local == peer_role {
+        return IceValidation::Ok;
+    }
+    // Different roles: the peer must decide, and the one with the higher
+    // tiebreaker becomes the controlling side. Tiebreakers were handed out by
+    // separate servers, so a tie is possible.
+    let mine = local_tiebreaker.unwrap_or_default().0;
+    let theirs = peer_tiebreaker.unwrap_or_default().0;
+    if theirs > mine {
+        // The peer wins; the server had claimed the controlling role.
+        return IceValidation::RoleConflict;
+    }
+    if mine > theirs {
+        // The peer lost; it must re-check with the other role.
+        return IceValidation::RoleConflict;
+    }
+    IceValidation::RoleConflict
+}
+
+/// Validate the ICE role attributes of one `Binding` request.
+///
+/// Checks role conflict (487) and role/tiebreaker well-formedness (400).
+/// `peer_family` is the family of the connection the request arrived on, read
+/// from the socket; it is not used by the role check itself, it is carried so
+/// the caller can run [`validate_other_address`] against the same value.
+pub fn validate(attributes: &IceAttributes, _peer_family: IpFamily) -> IceValidation {
+    role_conflict(attributes.role, attributes.tiebreaker, None, None)
+}
+
+/// Validate an `OTHER-ADDRESS` attribute against the family of the connection
+/// the request arrived on.
+///
+/// `OTHER-ADDRESS` names the peer's own local address, so a peer that names a
+/// family different from the one this connection actually uses is not who it
+/// says it is: [`IceValidation::WrongFamily`], which maps to 400 Bad Request.
+/// Kept separate from [`validate`] because the attribute is optional and the
+/// caller extracts it per message.
+pub fn validate_other_address(other: &OtherAddress, peer_family: IpFamily) -> IceValidation {
+    if other.family.differs_from(peer_family) {
+        return IceValidation::WrongFamily;
+    }
+    IceValidation::Ok
+}
+
+/// The ICE-PRIORITY value on a `Binding` request is out of place: the
+/// attribute belongs on a candidate-check, and a server that answers it from a
+/// `Binding` request would be treating a control message as an ICE check.
+pub fn priority_on_binding(priority: Option<u32>) -> Option<ErrorCode> {
+    priority.map(|_| ErrorCode::UnknownAttribute)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiebreaker(v: u64) -> IceTiebreaker {
+        IceTiebreaker(v)
+    }
+
+    #[test]
+    fn the_family_codes_match_iana() {
+        assert_eq!(IpFamily::V4.code(), 0x01);
+        assert_eq!(IpFamily::V6.code(), 0x02);
+        assert!(IpFamily::V4.differs_from(IpFamily::V6));
+        assert!(!IpFamily::V4.differs_from(IpFamily::V4));
+    }
+
+    #[test]
+    fn a_binding_with_no_ice_attributes_is_valid() {
+        let attributes = IceAttributes::default();
+        assert_eq!(validate(&attributes, IpFamily::V4), IceValidation::Ok);
+        assert!(IceValidation::Ok.error().is_none());
+    }
+
+    #[test]
+    fn carrying_both_role_attributes_is_always_a_conflict() {
+        let attributes = IceAttributes {
+            role: IceRole::from_presence(true, true),
+            tiebreaker: Some(tiebreaker(1)),
+            ..Default::default()
+        };
+        assert_eq!(attributes.role, IceRole::Conflict);
+        assert_eq!(validate(&attributes, IpFamily::V4), IceValidation::Conflict);
+        assert_eq!(
+            IceValidation::Conflict.error(),
+            Some(ErrorCode::RoleConflict)
+        );
+        // 487, not the Unassigned 430 the issue asked for.
+        assert_eq!(ErrorCode::RoleConflict.number(), 487);
+    }
+
+    #[test]
+    fn a_role_attribute_without_a_tiebreaker_is_malformed() {
+        let attributes = IceAttributes {
+            role: IceRole::Controlling,
+            tiebreaker: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate(&attributes, IpFamily::V4),
+            IceValidation::Malformed
+        );
+        assert_eq!(
+            IceValidation::Malformed.error(),
+            Some(ErrorCode::BadRequest)
+        );
+    }
+
+    #[test]
+    fn other_address_must_match_the_peer_family() {
+        let other = OtherAddress {
+            family: IpFamily::V4,
+            address: {
+                let mut a = [0u8; 16];
+                a[12..].copy_from_slice(&[10, 0, 0, 7]);
+                a
+            },
+        };
+        assert_eq!(
+            other_address_to_ip_addr(other).unwrap().to_string(),
+            "10.0.0.7"
+        );
+        assert!(!other.family.differs_from(IpFamily::V4));
+
+        // Same family: fine.
+        assert_eq!(
+            validate_other_address(&other, IpFamily::V4),
+            IceValidation::Ok
+        );
+        // An IPv4 OTHER-ADDRESS from an IPv6 peer: the peer is not who it says.
+        assert_eq!(
+            validate_other_address(&other, IpFamily::V6),
+            IceValidation::WrongFamily
+        );
+        assert_eq!(
+            IceValidation::WrongFamily.error(),
+            Some(ErrorCode::BadRequest)
+        );
+    }
+
+    #[test]
+    fn other_address_rejects_an_unknown_family_code() {
+        let mut bytes = [0u8; 16];
+        bytes[4..8].copy_from_slice(&[10, 0, 0, 7]);
+        bytes[8] = 0x03;
+        assert!(other_address_from_bytes(bytes).is_none());
+
+        bytes[8] = 0x01;
+        let other = other_address_from_bytes(bytes).unwrap();
+        assert_eq!(other.family, IpFamily::V4);
+        assert_eq!(other_address_to_bytes(other), bytes);
+    }
+
+    #[test]
+    fn the_tiebreaker_round_trips_big_endian() {
+        let bytes: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(tiebreaker(1).as_bytes(), bytes);
+        assert_eq!(IceTiebreaker::from_bytes(bytes).0, 1);
+        assert_eq!(tiebreaker(u64::MAX).as_bytes()[0], 0xFF);
+    }
+
+    #[test]
+    fn with_no_local_role_the_role_check_is_a_noop() {
+        // The server is not an ICE endpoint, so it presents no role and the
+        // check cannot fire. A controlling peer is accepted either way.
+        let attributes = IceAttributes {
+            role: IceRole::Controlling,
+            tiebreaker: Some(tiebreaker(5)),
+            ..Default::default()
+        };
+        assert_eq!(validate(&attributes, IpFamily::V4), IceValidation::Ok);
+        assert_eq!(
+            role_conflict(IceRole::Controlling, Some(tiebreaker(5)), None, None),
+            IceValidation::Ok
+        );
+    }
+
+    #[test]
+    fn the_role_conflict_check_fires_on_a_different_local_role() {
+        // The server claims Controlling, the peer claims Controlled, and the
+        // peer's tiebreaker is lower: the peer loses and must re-check.
+        assert_eq!(
+            role_conflict(
+                IceRole::Controlled,
+                Some(tiebreaker(1)),
+                Some(IceRole::Controlling),
+                Some(tiebreaker(2)),
+            ),
+            IceValidation::RoleConflict
+        );
+        // Tiebreakers are issued by different servers, so a tie is possible.
+        assert_eq!(
+            role_conflict(
+                IceRole::Controlled,
+                Some(tiebreaker(2)),
+                Some(IceRole::Controlling),
+                Some(tiebreaker(2)),
+            ),
+            IceValidation::RoleConflict
+        );
+        // Same role, no conflict.
+        assert_eq!(
+            role_conflict(
+                IceRole::Controlling,
+                Some(tiebreaker(2)),
+                Some(IceRole::Controlling),
+                Some(tiebreaker(9)),
+            ),
+            IceValidation::Ok
+        );
+    }
+
+    #[test]
+    fn a_priority_attribute_on_binding_is_unknown_attribute() {
+        assert_eq!(
+            priority_on_binding(Some(0x6e00_01ff)),
+            Some(ErrorCode::UnknownAttribute)
+        );
+        assert_eq!(priority_on_binding(None), None);
+    }
+
+    #[test]
+    fn unknown_attributes_map_to_388() {
+        assert_eq!(
+            IceValidation::UnknownAttribute.error(),
+            Some(ErrorCode::UnknownAttribute)
+        );
+        assert_eq!(ErrorCode::UnknownAttribute.number(), 388);
+    }
+
+    #[test]
+    fn use_candidate_is_just_a_transport_of_the_peer_flag() {
+        let attributes = IceAttributes {
+            use_candidate: true,
+            role: IceRole::Controlling,
+            tiebreaker: Some(tiebreaker(1)),
+            ..Default::default()
+        };
+        assert!(attributes.use_candidate);
+        // USE-CANDIDATE alone does not make the request invalid: the server is
+        // not an ICE agent and does not nominate.
+        assert_eq!(validate(&attributes, IpFamily::V4), IceValidation::Ok);
+    }
 }
