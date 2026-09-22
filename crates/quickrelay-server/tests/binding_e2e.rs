@@ -42,8 +42,13 @@ fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
     let mut head = [0u8; FRAME_PREFIX_LEN];
     let mut got = 0usize;
     while got < head.len() {
-        let n = stream.read(&mut head[got..]).unwrap_or(0);
-        assert!(n > 0, "the server closed the connection mid-header");
+        let n = match stream.read(&mut head[got..]) {
+            Ok(n) => n,
+            Err(e) => panic!("the server failed the read: {e}"),
+        };
+        if n == 0 {
+            panic!("the server closed the connection mid-header");
+        }
         got += n;
     }
     let len = u16::from_be_bytes(head) as usize;
@@ -71,11 +76,14 @@ fn start_worker(config: WorkerConfig) -> (quickrelay_transport::worker::WorkerWa
     let udp = worker.udp_local_addr().unwrap();
     let tcp = worker.listener_local_addr().unwrap();
     // Each path answers as the address it actually leaves from: a UDP reply
-    // from the datagram socket, a TCP reply from the listener.
+    // from the datagram socket, a TCP reply from the listener. The listen list
+    // is what a CHANGE-REQUEST is resolved against, so it must name both.
     worker.handler_mut().set_udp(reply_socket(udp).unwrap());
-    worker.handler_mut().set_tcp_identity(
+    worker.handler_mut().set_tcp_identity(binding_chain_identity(tcp));
+    worker.handler_mut().set_addresses(vec![
+        binding_chain_identity(udp),
         binding_chain_identity(tcp),
-    );
+    ]);
 
     std::thread::spawn(move || {
         let events = &mut Events::with_capacity(EVENT_CAPACITY);
@@ -201,6 +209,151 @@ fn a_software_request_is_echoed_back_over_tcp() {
     let msg = parse(&reply).unwrap();
     assert_eq!(msg.msg_type(), MessageType::BINDING_SUCCESS);
     assert!(msg.software().is_some(), "SOFTWARE must be echoed");
+
+    wake.wake();
+}
+
+#[test]
+fn a_combined_change_request_answers_386_not_437() {
+    let (wake, _udp, tcp) = start_worker(quiet_config());
+
+    let mut peer = TcpStream::connect(tcp).unwrap();
+    peer.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    // `A`|`B` over IPv4 is what CHANGE-ADDRESS meant, so the error row is
+    // 386 Change-Address, not the 437 that a family failure carries.
+    let request = build_response(
+        MessageType::BINDING_REQUEST.bits(),
+        &txid(),
+        &[Attribute::ChangeRequest(0x0000_0003)],
+        None,
+        false,
+    )
+    .unwrap();
+    write_frame(&mut peer, &request);
+
+    let reply = read_frame(&mut peer);
+    let msg = parse(&reply).unwrap();
+    assert_eq!(msg.msg_type(), MessageType::BINDING_ERROR);
+    assert!(msg.xor_mapped_address().is_none(), "an error must not map");
+    assert_eq!(
+        msg.error().expect("ERROR-CODE").as_u16(),
+        quickrelay_binding::ErrorCode::ChangeAddress.number()
+    );
+
+    wake.wake();
+}
+
+#[test]
+fn both_ice_roles_answer_role_conflict_487() {
+    let (wake, _udp, tcp) = start_worker(quiet_config());
+
+    let mut peer = TcpStream::connect(tcp).unwrap();
+    peer.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    // RFC 8445 §7.2.1.1: a peer claiming both roles is a conflict, answered
+    // 487 Role Conflict. It is not 430, which IANA has not assigned.
+    let request = build_response(
+        MessageType::BINDING_REQUEST.bits(),
+        &txid(),
+        &[
+            Attribute::IceControlled([0, 0, 0, 0, 0, 0, 0, 1]),
+            Attribute::IceControlling([0, 0, 0, 0, 0, 0, 0, 2]),
+        ],
+        None,
+        false,
+    )
+    .unwrap();
+    write_frame(&mut peer, &request);
+
+    let reply = read_frame(&mut peer);
+    let msg = parse(&reply).unwrap();
+    assert_eq!(msg.msg_type(), MessageType::BINDING_ERROR);
+    assert!(msg.xor_mapped_address().is_none(), "an error must not map");
+    let error = msg.error().expect("ERROR-CODE");
+    assert_eq!(error.as_u16(), quickrelay_binding::ErrorCode::RoleConflict.number());
+    assert_eq!(error.as_u16(), 487, "the role conflict is 487, not 430");
+
+    wake.wake();
+}
+
+#[test]
+fn the_same_ice_roles_over_udp_also_answer_487() {
+    let (wake, udp, _tcp) = start_worker(quiet_config());
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let request = build_response(
+        MessageType::BINDING_REQUEST.bits(),
+        &txid(),
+        &[
+            Attribute::IceControlled([0, 0, 0, 0, 0, 0, 0, 1]),
+            Attribute::IceControlling([0, 0, 0, 0, 0, 0, 0, 2]),
+        ],
+        None,
+        false,
+    )
+    .unwrap();
+    client.send_to(&request, udp).unwrap();
+
+    let mut buffer = vec![0u8; MAX_UDP_DATAGRAM];
+    let (n, _from) = client.recv_from(&mut buffer).unwrap();
+    let msg = parse(&buffer[..n]).unwrap();
+    assert_eq!(msg.msg_type(), MessageType::BINDING_ERROR);
+    assert_eq!(msg.error().expect("ERROR-CODE").as_u16(), 487);
+
+    wake.wake();
+}
+
+#[test]
+fn a_change_request_against_a_second_listener_is_honored() {
+    // A worker that listens on two addresses can honor the `B` bit: same
+    // address, different port. Before this worker received the address list
+    // the same request answered 437, so this is the wiring test.
+    let listening = SocketAddr::from(([127, 0, 0, 1], 0));
+    let config = quiet_config();
+    let (mut worker, wake) = Worker::new(config, BindingHandler::new()).unwrap();
+    worker.new_udp(listening, 0).unwrap();
+    let udp = worker.udp_local_addr().unwrap();
+    worker.new_tcp(listening).unwrap();
+    let tcp = worker.listener_local_addr().unwrap();
+    worker.handler_mut().set_udp(reply_socket(udp).unwrap());
+    worker.handler_mut().set_tcp_identity(binding_chain_identity(tcp));
+    let other = SocketAddr::new(tcp.ip(), udp.port());
+    worker.handler_mut().set_addresses(vec![
+        binding_chain_identity(udp),
+        binding_chain_identity(tcp),
+        binding_chain_identity(other),
+    ]);
+
+    std::thread::spawn(move || {
+        let events = &mut Events::with_capacity(EVENT_CAPACITY);
+        let _ = worker.run(events);
+    });
+
+    let mut peer = TcpStream::connect(tcp).unwrap();
+    peer.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let request = build_response(
+        MessageType::BINDING_REQUEST.bits(),
+        &txid(),
+        &[Attribute::ChangeRequest(0x0000_0002)],
+        None,
+        false,
+    )
+    .unwrap();
+    write_frame(&mut peer, &request);
+
+    let reply = read_frame(&mut peer);
+    let msg = parse(&reply).unwrap();
+    assert_eq!(msg.msg_type(), MessageType::BINDING_SUCCESS);
+    let mapped = msg.xor_mapped_address().expect("XOR-MAPPED-ADDRESS");
+    assert_eq!(mapped.ipv4(), Some((127, 0, 0, 1)));
+    assert_ne!(
+        mapped.port,
+        tcp.port(),
+        "the B bit must change the port the reply reports"
+    );
+    // The resolved candidate must be an address the worker knows.
+    let known = [tcp.port(), udp.port(), other.port()];
+    assert!(known.contains(&mapped.port), "not in the listen list");
 
     wake.wake();
 }

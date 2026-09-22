@@ -8,6 +8,7 @@ use clap::Parser;
 use mio::event::Events;
 use quickrelay_transport::worker::{Worker, WorkerConfig, WorkerWake, EVENT_CAPACITY};
 
+use quickrelay_binding as binding;
 use quickrelay_server::binding_chain;
 
 /// The control latch. The main thread raises it, every worker waits on it.
@@ -127,6 +128,29 @@ fn parse_address(value: &str) -> Result<IpAddr, String> {
     value.parse().map_err(|e: std::net::AddrParseError| e.to_string())
 }
 
+/// The address list a CHANGE-REQUEST is resolved against: the configured
+/// listeners, minus the placeholders the kernel replaces for us.
+///
+/// A wildcard IP and port `0` are not addresses any reply leaves from, so they
+/// cannot satisfy or block a flag — the identities of the sockets they became
+/// are added when the worker binds, through `set_udp` and `set_tcp_identity`.
+fn listen_identities(listeners: &[SocketAddr]) -> Vec<binding::ServerIdentity> {
+    let mut out: Vec<binding::ServerIdentity> = Vec::new();
+    for address in listeners {
+        if matches!(address.ip(), IpAddr::V4(v4) if v4.is_unspecified())
+            || matches!(address.ip(), IpAddr::V6(v6) if v6.is_unspecified())
+            || address.port() == 0
+        {
+            continue;
+        }
+        let identity = binding_chain::identity_of_socket(*address);
+        if !out.contains(&identity) {
+            out.push(identity);
+        }
+    }
+    out
+}
+
 /// Whether stdin should be read as a stop request. A terminal implies an
 /// operator who is watching; anything else needs an explicit opt-in.
 fn stdin_control_is_live(control_stdin: bool) -> bool {
@@ -139,6 +163,7 @@ fn start_worker(
     index: usize,
     count: usize,
     listening: SocketAddr,
+    listeners: &[SocketAddr],
     rcvbuf: usize,
 ) -> std::io::Result<Option<RunningWorker>> {
     let config = WorkerConfig {
@@ -149,7 +174,14 @@ fn start_worker(
         tcp_addr: Some(listening),
         ..WorkerConfig::default()
     };
-    let handler = binding_chain::BindingHandler::new();
+    let mut handler = binding_chain::BindingHandler::new();
+    // The configured listen list, minus the placeholders the kernel
+    // substitutes: a CHANGE-REQUEST is resolved against every address the
+    // process binds, so a flag the one socket cannot honor is still answerable
+    // when another listener can. The sockets the placeholders became join the
+    // list when they are bound.
+    let addresses = listen_identities(listeners);
+    handler.set_addresses(addresses);
     let (mut worker, wake) = Worker::new(config, handler)?;
 
     // Bind the datagram socket, then give the handler a sender bound to the
@@ -233,7 +265,7 @@ fn main() -> Result<(), String> {
     let mut running = Vec::new();
     for index in 0..cli.workers {
         let listening = listeners[index % listeners.len()];
-        match start_worker(index, cli.workers, listening, cli.udp_rbuf_size)
+        match start_worker(index, cli.workers, listening, &listeners, cli.udp_rbuf_size)
             .map_err(|e| format!("failed to start worker {index}: {e}"))?
         {
             Some(worker) => running.push(worker),

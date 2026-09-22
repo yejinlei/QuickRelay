@@ -8,11 +8,13 @@
 //! [`binding::BindingResponsePlan`] back into wire bytes through
 //! [`protocol::build_response`].
 //!
-//! `binding` ships the decision table but no function that takes facts and
-//! returns a plan, so this file also carries the small amount of glue that
-//! reads the request's facts, fills the plan and renders it. The two-way rule
-//! still holds: no error-code literal, no CHANGE code point and no
-//! length-prefix read appears here that its owning crate does not own.
+//! The decision itself lives in `binding::decide`, which takes a
+//! [`binding::BindingRequestFacts`] and returns a plan with no wire types.
+//! This file owns the two things `binding` deliberately does not: reading the
+//! facts out of a parsed message (direction 1) and rendering a plan into
+//! attribute bytes (direction 2). The two-way rule still holds: no
+//! error-code literal and no length-prefix read appears here that its owning
+//! crate does not own.
 
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -80,15 +82,22 @@ impl ReplyPath {
 pub struct ServerBindingSink {
     /// The path this sink replies on.
     reply_path: ReplyPath,
+    /// The identity a `ChangeSource::Default` answer reports: the socket this
+    /// reply actually leaves from.
+    default_identity: binding::ServerIdentity,
     /// A control-connection reply waiting for the loop to write it.
     queued: Option<transport::QueuedReply>,
 }
 
 impl ServerBindingSink {
-    /// A sink that replies on `path`.
-    fn for_path(path: ReplyPath) -> Self {
+    /// A sink that replies on `path` and reports `default_identity`.
+    fn for_path(
+        path: ReplyPath,
+        default_identity: binding::ServerIdentity,
+    ) -> Self {
         ServerBindingSink {
             reply_path: path,
+            default_identity,
             queued: None,
         }
     }
@@ -108,7 +117,7 @@ impl ServerBindingSink {
 impl binding::ResponseSink for ServerBindingSink {
     fn send_plan(&mut self, plan: &binding::BindingResponsePlan, transaction_id: [u8; 12]) {
         let txid = protocol::TransactionId::from(transaction_id);
-        let attrs = plan_attributes(plan);
+        let attrs = plan_attributes(plan, self.default_identity);
         let msg_type = match plan.outcome {
             Outcome::Success => protocol::MessageType::BINDING_SUCCESS,
             Outcome::Error(_) => protocol::MessageType::BINDING_ERROR,
@@ -137,18 +146,29 @@ impl binding::ResponseSink for ServerBindingSink {
 /// the header. Order is fixed — `ERROR-CODE` on failure, otherwise
 /// `XOR-MAPPED-ADDRESS`, `ALTERNATE-SERVER`, then `SOFTWARE` — so every caller
 /// renders identically.
-fn plan_attributes(plan: &binding::BindingResponsePlan) -> Vec<protocol::Attribute> {
+///
+/// `default` is the identity a `ChangeSource::Default` answer leaves from:
+/// the plan names the default only relatively, and only this crate knows what
+/// the socket is actually bound to.
+fn plan_attributes(
+    plan: &binding::BindingResponsePlan,
+    default: binding::ServerIdentity,
+) -> Vec<protocol::Attribute> {
     match plan.outcome {
         Outcome::Success => {
             let mut attrs = Vec::new();
             if plan.include_xor_mapped {
-                attrs.push(protocol::Attribute::XorMappedAddress(mapped_attr(plan.source)));
+                attrs.push(protocol::Attribute::XorMappedAddress(
+                    mapped_attr(plan.source, default),
+                ));
             }
             if plan.include_alternate_server {
                 // `source` carries the alternate identity whenever
                 // `include_alternate_server` is set: that is the one value the
                 // plan exposes for it.
-                attrs.push(protocol::Attribute::AlternateServer(mapped_attr(plan.source)));
+                attrs.push(protocol::Attribute::AlternateServer(
+                    mapped_attr(plan.source, default),
+                ));
             }
             if plan.include_software {
                 attrs.push(protocol::Attribute::Software(SOFTWARE_NAME.to_string()));
@@ -173,19 +193,22 @@ fn error_code_attr(code: binding::ErrorCode) -> protocol::Attribute {
 }
 
 /// The MAPPED-ADDRESS value a decided source answers as.
-fn mapped_attr(source: ChangeSource) -> protocol::MappedAddress {
+fn mapped_attr(source: ChangeSource, default: binding::ServerIdentity) -> protocol::MappedAddress {
     match source {
-        ChangeSource::Default => protocol::MappedAddress::from_ipv4(127, 0, 0, 1, 3478),
-        ChangeSource::Explicit(id) => {
-            let port = id.port;
-            if id.is_ipv4 {
-                protocol::MappedAddress::from_ipv4(
-                    id.address[12], id.address[13], id.address[14], id.address[15], port,
-                )
-            } else {
-                protocol::MappedAddress::from_ipv6(id.address, port)
-            }
-        }
+        ChangeSource::Default => identity_attr(default),
+        ChangeSource::Explicit(id) => identity_attr(id),
+    }
+}
+
+/// The MAPPED-ADDRESS value for one identity.
+fn identity_attr(id: binding::ServerIdentity) -> protocol::MappedAddress {
+    let port = id.port;
+    if id.is_ipv4 {
+        protocol::MappedAddress::from_ipv4(
+            id.address[12], id.address[13], id.address[14], id.address[15], port,
+        )
+    } else {
+        protocol::MappedAddress::from_ipv6(id.address, port)
     }
 }
 
@@ -194,8 +217,9 @@ fn mapped_attr(source: ChangeSource) -> protocol::MappedAddress {
 pub fn render_plan(
     plan: &binding::BindingResponsePlan,
     txid: protocol::TransactionId,
+    default: binding::ServerIdentity,
 ) -> Result<Vec<u8>, protocol::Error> {
-    let attrs = plan_attributes(plan);
+    let attrs = plan_attributes(plan, default);
     let msg_type = match plan.outcome {
         Outcome::Success => protocol::MessageType::BINDING_SUCCESS,
         Outcome::Error(_) => protocol::MessageType::BINDING_ERROR,
@@ -218,8 +242,9 @@ pub fn extract_change_request(msg: &protocol::Message) -> Option<binding::Change
 /// Direction 1: read the request's ICE attributes (RFC 8445 §7.1.3.1).
 ///
 /// `binding` has the validation table but no reader, so the extraction is
-/// here. The role-conflict *decision* still lands with session state, which
-/// Stage 3 owns.
+/// here. Carrying both role attributes is a conflict the decision turns into
+/// 487; a role attribute that would not parse at all never reaches the
+/// decision, because the message would have failed to parse first.
 pub fn extract_ice(msg: &protocol::Message) -> binding::IceAttributes {
     let controlled = msg.find(protocol::AttrCode::IceControlled.as_u16());
     let controlling = msg.find(protocol::AttrCode::IceControlling.as_u16());
@@ -250,47 +275,78 @@ pub fn extract_ice(msg: &protocol::Message) -> binding::IceAttributes {
     }
 }
 
-/// Read the request's facts and fill the plan.
+/// Direction 1: the attribute codes a Binding server must comprehend but
+/// cannot find here, as a list [`binding::decide`] turns into 388.
 ///
-/// `source` is the identity the reply normally leaves from — the worker's own
-/// bound socket — and `change_second` is a second identity a CHANGE-REQUEST
-/// may switch the reply to. With no session state, CHANGE-REQUEST cannot be
-/// honored: one worker owns one bound socket. Rather than silently ignore the
-/// request, which would make the peer retransmit against an address the
-/// server never listens on, the plan answers with
-/// `UnsupportedAddressFamily`.
+/// A Binding server knows `binding::NOT_COMPREHENSION_REQUIRED` — the set it
+/// may ignore silently — plus `BINDING_KNOWN`, the ICE and echo attributes it
+/// reads and decides on. Every other attribute in a Binding request is a 388.
+/// `BINDING_KNOWN` is a separate constant rather than a field of the decision
+/// crate so the comprehension table stays exactly the one a Binding server
+/// may keep and still reject the rest. `codes` is the caller's scratch, so
+/// the result borrows it rather than the message, and the buffer stays on the
+/// stack.
+const BINDING_KNOWN: [u16; 3] = [
+    protocol::AttrCode::Software.as_u16(),      // 0x8022, echoed
+    protocol::AttrCode::IceControlled.as_u16(), // 0x8029, the role
+    protocol::AttrCode::IceControlling.as_u16(),// 0x802A, the role
+];
+
+fn unknown_attribute_codes<'buf>(
+    msg: &protocol::Message,
+    codes: &'buf mut [u16; 64],
+) -> Option<&'buf [u16]> {
+    let mut n = 0;
+    for attr in msg.attributes() {
+        let code = protocol::attribute_kind(attr).as_u16();
+        if !binding::NOT_COMPREHENSION_REQUIRED.contains(&code)
+            && !BINDING_KNOWN.contains(&code)
+        {
+            if n < codes.len() {
+                codes[n] = code;
+            }
+            n += 1;
+        }
+    }
+    for attr in &msg.unknown {
+        if n < codes.len() {
+            codes[n] = attr.code;
+        }
+        n += 1;
+    }
+    if n == 0 {
+        None
+    } else {
+        Some(&codes[..n.min(codes.len())])
+    }
+}
+
+/// Read the request's facts and decide the plan.
+///
+/// `peer` is the source the request was read from, `source` the identity the
+/// reply normally leaves from, and `addresses` every address this worker can
+/// send from — the full listen list `CHANGE-REQUEST` is resolved against.
+/// Without `addresses` a combined flag would always fail, so a worker that
+/// only knows its own socket answers from it and says 437 or 386 where the
+/// flag genuinely cannot be met.
 pub fn plan_for_request(
     msg: &protocol::Message,
+    peer: SocketAddr,
     source: Option<binding::ServerIdentity>,
-    change_second: Option<binding::ServerIdentity>,
+    addresses: &[binding::ServerIdentity],
 ) -> binding::BindingResponsePlan {
-    let change = extract_change_request(msg).unwrap_or_default();
-    let requested = change.change_ip || change.change_port;
-
-    if requested && change_second.is_none() {
-        return binding::BindingResponsePlan {
-            outcome: Outcome::Error(binding::ErrorCode::UnsupportedAddressFamily),
-            include_xor_mapped: false,
-            source: ChangeSource::Default,
-            include_alternate_server: false,
-            include_software: false,
-        };
-    }
-
-    let source = if requested { change_second } else { source };
-    binding::BindingResponsePlan {
-        outcome: Outcome::Success,
-        include_xor_mapped: true,
-        source: source.map(ChangeSource::Explicit).unwrap_or(ChangeSource::Default),
-        include_alternate_server: false,
-        include_software: msg
+    let mut codes = [0u16; 64];
+    let facts = binding::BindingRequestFacts {
+        peer,
+        change: extract_change_request(msg),
+        ice: extract_ice(msg),
+        software_requested: msg
             .find(protocol::AttrCode::Software.as_u16())
-            .and_then(|attr| match attr {
-                protocol::Attribute::Software(_) => Some(()),
-                _ => None,
-            })
             .is_some(),
-    }
+        unknown_attributes: unknown_attribute_codes(msg, &mut codes),
+        redirect_to: None,
+    };
+    binding::decide(&facts, source, addresses)
 }
 
 /// The identity a socket answers as. `address` is always the full 16-octet
@@ -362,6 +418,10 @@ pub struct BindingHandler {
     /// The identity a control-connection reply answers as: the address the
     /// peer's TCP stream reached, which is not necessarily the UDP socket's.
     tcp_identity: Option<binding::ServerIdentity>,
+    /// Every address this worker can send from, the list
+    /// `CHANGE-REQUEST` is resolved against. Populated by the control plane
+    /// from the sockets it actually bound.
+    addresses: Vec<binding::ServerIdentity>,
     /// Live control connections, keyed by the loop's connection id.
     conns: HashSet<transport::ConnectionId>,
     /// Replies queued for control connections, oldest first.
@@ -375,21 +435,49 @@ impl BindingHandler {
     }
 
     /// Attach the UDP sender. Its bound address becomes the UDP reply
-    /// identity.
+    /// identity and joins the listen list.
     pub fn set_udp(&mut self, socket: UdpSocket) {
         self.udp_identity = socket.local_addr().ok().map(identity_of_socket);
+        if let Some(identity) = self.udp_identity {
+            self.add_address(identity);
+        }
         self.udp = Some(socket);
     }
 
     /// Record the identity a control-connection reply answers as.
     pub fn set_tcp_identity(&mut self, identity: binding::ServerIdentity) {
         self.tcp_identity = Some(identity);
+        self.add_address(identity);
     }
 
     /// Record the reply identity when the socket set is described separately.
     pub fn set_identity(&mut self, identity: binding::ServerIdentity) {
         self.udp_identity = Some(identity);
         self.tcp_identity = Some(identity);
+        self.add_address(identity);
+    }
+
+    /// Describe every address this worker can send from. Called with the
+    /// process's full listen list so a `CHANGE-REQUEST` that names a second
+    /// address is resolved against what the server really binds, not just the
+    /// one socket this request came in on.
+    pub fn set_addresses<I>(&mut self, addresses: I)
+    where
+        I: IntoIterator<Item = binding::ServerIdentity>,
+    {
+        self.addresses = addresses.into_iter().collect();
+    }
+
+    /// Add one address to the listen list, keeping it free of duplicates.
+    fn add_address(&mut self, identity: binding::ServerIdentity) {
+        if !self.addresses.contains(&identity) {
+            self.addresses.push(identity);
+        }
+    }
+
+    /// The address list `CHANGE-REQUEST` resolves against.
+    fn addresses(&self) -> &[binding::ServerIdentity] {
+        &self.addresses
     }
 
     /// A control connection was accepted; remember its reply path.
@@ -453,11 +541,18 @@ impl transport::BindingHandler for BindingHandler {
         }
         // No decodable peer address means no path back; answering would mean
         // guessing, which is worse than the peer retransmitting.
-        if parse_peer_addr(src_addr).is_none() {
+        let Some(peer) = parse_peer_addr(src_addr) else {
             return;
-        }
-        let plan = plan_for_request(&msg, self.udp_identity, None);
-        let mut sink = ServerBindingSink::for_path(self.reply_path(src_addr));
+        };
+        let Some(default_identity) = self.udp_identity else {
+            // No bound socket means no address to report and nowhere to send.
+            return;
+        };
+        let plan = plan_for_request(&msg, peer, Some(default_identity), self.addresses());
+        let mut sink = ServerBindingSink::for_path(
+            self.reply_path(src_addr),
+            default_identity,
+        );
         binding::ResponseSink::send_plan(&mut sink, &plan, msg.transaction_id().into());
         if let Some(reply) = sink.drain() {
             self.enqueue(reply);
@@ -479,8 +574,16 @@ impl transport::BindingHandler for BindingHandler {
             // The connection is gone; there is no path to answer on.
             return;
         }
-        let plan = plan_for_request(&msg, self.tcp_identity, None);
-        let mut sink = ServerBindingSink::for_path(ReplyPath::Tcp(id));
+        let Some(default_identity) = self.tcp_identity else {
+            // A control path with no identity has no address to report.
+            return;
+        };
+        // The peer the TCP stream reached is the listener's address: a
+        // Binding request over ICE-TCP reports the address the connection
+        // was made to, which is where the reply leaves from.
+        let peer = default_identity.to_socket_addr();
+        let plan = plan_for_request(&msg, peer, Some(default_identity), self.addresses());
+        let mut sink = ServerBindingSink::for_path(ReplyPath::Tcp(id), default_identity);
         binding::ResponseSink::send_plan(&mut sink, &plan, msg.transaction_id().into());
         if let Some(reply) = sink.drain() {
             self.enqueue(reply);
@@ -559,6 +662,19 @@ mod tests {
         }
     }
 
+    /// The peer every test request comes from.
+    const PEER: &str = "10.0.0.7:50000";
+
+    /// The peer, parsed fresh for each test.
+    fn peer() -> SocketAddr {
+        PEER.parse().unwrap()
+    }
+
+    /// The worker's default listen identity.
+    fn default_identity() -> binding::ServerIdentity {
+        identity_of(10, 0, 0, 1, 3478)
+    }
+
     #[test]
     fn extract_change_request_reads_the_flag_bits() {
         let msg = parsed(&[change_attr(0x0000_0003)]);
@@ -573,13 +689,14 @@ mod tests {
     #[test]
     fn a_plain_request_answers_success_with_xor_mapped() {
         let msg = parsed(&[]);
-        let plan = plan_for_request(&msg, Some(identity_of(127, 0, 0, 1, 3478)), None);
+        let default = identity_of(127, 0, 0, 1, 3478);
+        let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
         assert_eq!(plan.outcome, Outcome::Success);
         assert!(plan.include_xor_mapped);
         assert!(!plan.include_software);
         assert!(!plan.include_alternate_server);
 
-        let bytes = render_plan(&plan, protocol::TransactionId::from(TXID)).unwrap();
+        let bytes = render_plan(&plan, protocol::TransactionId::from(TXID), default).unwrap();
         let reply = protocol::parse(&bytes).unwrap();
         assert_eq!(reply.msg_type(), protocol::MessageType::BINDING_SUCCESS);
         assert_eq!(reply.transaction_id(), protocol::TransactionId::from(TXID));
@@ -590,9 +707,11 @@ mod tests {
 
     #[test]
     fn a_software_request_makes_the_plan_echo_software() {
-        let plan = plan_for_request(&parsed(&[software_attr("test client")]), None, None);
+        let default = default_identity();
+        let msg = parsed(&[software_attr("test client")]);
+        let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
         assert!(plan.include_software);
-        let attrs = plan_attributes(&plan);
+        let attrs = plan_attributes(&plan, default);
         assert!(
             attrs
                 .iter()
@@ -602,29 +721,94 @@ mod tests {
     }
 
     #[test]
-    fn an_unhonorably_requested_change_answers_unsupported_address_family() {
-        let code = binding::ErrorCode::UnsupportedAddressFamily;
-        let plan = plan_for_request(&parsed(&[change_attr(0x0000_0001)]), None, None);
-        assert_eq!(plan.outcome, Outcome::Error(code));
-        assert!(!plan.include_xor_mapped);
-
-        let bytes = render_plan(&plan, protocol::TransactionId::from(TXID)).unwrap();
-        let reply = protocol::parse(&bytes).unwrap();
-        assert_eq!(reply.msg_type(), protocol::MessageType::BINDING_ERROR);
-        let error = reply.error().expect("ERROR-CODE");
-        assert_eq!(error.as_u16(), code.number());
-        assert_eq!(&error.reason, code.reason().as_str().as_bytes());
+    fn an_ice_priority_on_a_binding_request_answers_388() {
+        // ICE-PRIORITY belongs on a candidate check, not a control message:
+        // the attribute is unknown to a Binding server.
+        let default = default_identity();
+        let msg = parsed(&[protocol::Attribute::IcePriority(0x6e00_01ff)]);
+        let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnknownAttribute));
+        assert_eq!(
+            plan.outcome.error().unwrap().number(),
+            388
+        );
     }
 
     #[test]
-    fn a_change_request_with_a_second_source_honors_it() {
+    fn an_attribute_the_binding_server_does_not_comprehend_answers_388() {
+        // USERNAME is a TURN attribute: a Binding server that meets it must
+        // reject rather than ignore.
+        let default = default_identity();
+        let msg = parsed(&[protocol::Attribute::Username("alice".to_string())]);
+        let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnknownAttribute));
+        assert!(!plan.include_xor_mapped);
+    }
+
+    #[test]
+    fn a_clashing_ice_role_answers_role_conflict_487() {
+        // RFC 8445 §7.2.1.1: 487 Role Conflict, not the Unassigned 430.
+        let default = default_identity();
+        let msg = parsed(&[
+            ice_attr(protocol::AttrCode::IceControlled.as_u16(), [0, 0, 0, 0, 0, 0, 0, 1]),
+            ice_attr(protocol::AttrCode::IceControlling.as_u16(), [0, 0, 0, 0, 0, 0, 0, 2]),
+        ]);
+        let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::RoleConflict));
+        assert_eq!(plan.outcome.error().unwrap().number(), 487);
+        assert!(!plan.include_xor_mapped);
+
+        // A single well-formed role is accepted.
+        let msg = parsed(&[ice_attr(
+            protocol::AttrCode::IceControlling.as_u16(),
+            [0, 0, 0, 0, 0, 0, 0, 2],
+        )]);
+        let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Success);
+    }
+
+    #[test]
+    fn a_change_request_no_candidate_satisfies_answers_437() {
+        // `B` alone asks for the same address on a different port, and the
+        // listen list holds only the default: 437, with no mapped address.
+        let default = default_identity();
+        let msg = parsed(&[change_attr(0x0000_0002)]);
+        let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnsupportedAddressFamily));
+        assert_eq!(plan.outcome.error().unwrap().number(), 437);
+        assert!(!plan.include_xor_mapped);
+
+        let bytes = render_plan(&plan, protocol::TransactionId::from(TXID), default).unwrap();
+        let reply = protocol::parse(&bytes).unwrap();
+        assert_eq!(reply.msg_type(), protocol::MessageType::BINDING_ERROR);
+        let error = reply.error().expect("ERROR-CODE");
+        assert_eq!(error.as_u16(), binding::ErrorCode::UnsupportedAddressFamily.number());
+        assert_eq!(&error.reason, binding::ErrorCode::UnsupportedAddressFamily.reason().as_str().as_bytes());
+    }
+
+    #[test]
+    fn a_combined_change_request_with_no_candidate_answers_386() {
+        // The IPv4 form of `A`|`B` is what the legacy CHANGE-ADDRESS meant, so
+        // the error is 386 Change-Address rather than 437.
+        let default = default_identity();
+        let msg = parsed(&[change_attr(0x0000_0003)]);
+        let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::ChangeAddress));
+        assert_eq!(plan.outcome.error().unwrap().number(), 386);
+    }
+
+    #[test]
+    fn a_change_request_resolved_against_the_listen_list_is_honored() {
+        let default = default_identity();
         let second = identity_of(10, 0, 0, 9, 3479);
-        let plan = plan_for_request(&parsed(&[change_attr(0x0000_0003)]), None, Some(second));
+        let msg = parsed(&[change_attr(0x0000_0003)]);
+        let plan = plan_for_request(&msg, peer(), Some(default), &[default, second]);
         assert_eq!(plan.outcome, Outcome::Success);
         assert_eq!(plan.source, ChangeSource::Explicit(second));
 
-        let attrs = plan_attributes(&plan);
-        let protocol::Attribute::XorMappedAddress(addr) = &attrs[0] else {
+        let attrs = plan_attributes(&plan, default);
+        let protocol::Attribute::XorMappedAddress(addr) = attrs.first().expect("XOR-MAPPED-ADDRESS")
+        else {
             panic!("the reply must carry an XOR-MAPPED-ADDRESS");
         };
         assert_eq!(addr.ipv4(), Some((10, 0, 0, 9)));
@@ -632,27 +816,28 @@ mod tests {
     }
 
     #[test]
-    fn without_a_second_source_the_plan_keeps_the_default_source() {
-        let default = identity_of(127, 0, 0, 1, 3478);
-        let plan = plan_for_request(&parsed(&[change_attr(0x0000_0002)]), None, None);
-        assert_eq!(
-            plan.outcome,
-            Outcome::Error(binding::ErrorCode::UnsupportedAddressFamily)
-        );
-
-        // The same request with a second source available succeeds instead.
-        let plan = plan_for_request(&parsed(&[change_attr(0x0000_0002)]), Some(default), None);
+    fn a_change_request_without_any_source_answers_437() {
+        // No default source and no listen list: a `B` request cannot be met.
+        let msg = parsed(&[change_attr(0x0000_0002)]);
+        let plan = plan_for_request(&msg, peer(), None, &[]);
         assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnsupportedAddressFamily));
+
+        // A plain request still succeeds: there is no address to report, but
+        // the sink supplies the socket it sends from.
+        let plan = plan_for_request(&parsed(&[]), peer(), None, &[]);
+        assert_eq!(plan.outcome, Outcome::Success);
+        assert_eq!(plan.source, ChangeSource::Default);
     }
 
     #[test]
     fn alternate_server_renders_from_the_plan_source() {
         let alternate = identity_of(10, 0, 0, 9, 3480);
-        let mut plan = plan_for_request(&parsed(&[]), None, None);
+        let default = default_identity();
+        let mut plan = plan_for_request(&parsed(&[]), peer(), Some(default), &[default]);
         plan.include_alternate_server = true;
         plan.source = ChangeSource::Explicit(alternate);
 
-        let attrs = plan_attributes(&plan);
+        let attrs = plan_attributes(&plan, default);
         assert!(
             attrs.iter().any(|a| match a {
                 protocol::Attribute::AlternateServer(addr) => {
@@ -716,13 +901,20 @@ mod tests {
         let v4 = identity_of_socket("127.0.0.1:3478".parse().unwrap());
         assert!(v4.is_ipv4);
         assert_eq!(v4.port, 3478);
-        assert_eq!(mapped_attr(ChangeSource::Explicit(v4)).ipv4(), Some((127, 0, 0, 1)));
+        assert_eq!(identity_attr(v4).ipv4(), Some((127, 0, 0, 1)));
 
         let v6 = identity_of_socket("[::1]:3478".parse().unwrap());
         assert!(!v6.is_ipv4);
         assert_eq!(v6.port, 3478);
-        let mapped = mapped_attr(ChangeSource::Explicit(v6));
+        let mapped = mapped_attr(ChangeSource::Explicit(v6), v4);
         assert_eq!(mapped.ipv6(), Some(Ipv6Addr::LOCALHOST.octets()));
+
+        // A default source answers as the socket it is attached to, not a
+        // hardcoded loopback: the render must report the real bound address.
+        let default = identity_of_socket("[::1]:3478".parse().unwrap());
+        let default_mapped = mapped_attr(ChangeSource::Default, default);
+        assert_eq!(default_mapped.ipv6(), Some(Ipv6Addr::LOCALHOST.octets()));
+        assert_eq!(default_mapped.port, 3478);
     }
 
     #[test]
@@ -749,7 +941,7 @@ mod tests {
 
     #[test]
     fn a_udp_reply_goes_back_to_the_peer_it_came_from() {
-        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
@@ -758,7 +950,7 @@ mod tests {
         assert!(handler.udp_identity.unwrap().is_ipv4);
 
         let datagram = request(&[]);
-        peer.send_to(&datagram, server_addr).unwrap();
+        client.send_to(&datagram, server_addr).unwrap();
         let mut buf = vec![0u8; transport::MAX_UDP_DATAGRAM];
         let (n, from) = server.recv_from(&mut buf).unwrap();
 
@@ -771,15 +963,19 @@ mod tests {
 
         handler.on_stun(&buf[..n], n, &src_raw);
 
-        peer.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
         let mut reply = vec![0u8; transport::MAX_UDP_DATAGRAM];
-        let (r, to) = peer.recv_from(&mut reply).unwrap();
+        let (r, to) = client.recv_from(&mut reply).unwrap();
         assert_eq!(to, server_addr, "the reply must leave the server socket");
 
         let msg = protocol::parse(&reply[..r]).unwrap();
         assert_eq!(msg.msg_type(), protocol::MessageType::BINDING_SUCCESS);
         assert_eq!(msg.transaction_id(), protocol::TransactionId::from(TXID));
-        assert!(msg.xor_mapped_address().is_some());
+        // The mapped address must name the socket the reply left from, not a
+        // hardcoded loopback: that is what a client decides its local port from.
+        let mapped = msg.xor_mapped_address().expect("XOR-MAPPED-ADDRESS");
+        assert_eq!(mapped.ipv4(), Some((127, 0, 0, 1)));
+        assert_eq!(mapped.port, server_addr.port());
     }
 
     #[test]
@@ -803,6 +999,7 @@ mod tests {
     #[test]
     fn a_tcp_reply_is_queued_and_then_drained() {
         let mut handler = BindingHandler::new();
+        handler.set_tcp_identity(identity_of(127, 0, 0, 1, 3478));
         let id = transport::ConnectionId(42);
         TBindingHandler::on_tcp_connect(&mut handler, id);
         assert_eq!(handler.live_conns(), 1);
@@ -824,6 +1021,7 @@ mod tests {
     #[test]
     fn a_reply_to_a_dropped_connection_is_discarded() {
         let mut handler = BindingHandler::new();
+        handler.set_tcp_identity(identity_of(127, 0, 0, 1, 3478));
         let live = transport::ConnectionId(1);
         let gone = transport::ConnectionId(2);
         TBindingHandler::on_tcp_connect(&mut handler, live);
@@ -845,6 +1043,7 @@ mod tests {
     #[test]
     fn a_drop_clears_replies_queued_for_it() {
         let mut handler = BindingHandler::new();
+        handler.set_tcp_identity(identity_of(127, 0, 0, 1, 3478));
         let gone = transport::ConnectionId(3);
         TBindingHandler::on_tcp_connect(&mut handler, gone);
         let datagram = request(&[]);
@@ -891,12 +1090,89 @@ mod tests {
     }
 
     #[test]
+    fn a_role_conflict_over_udp_and_tcp_answers_487() {
+        // RFC 8445 §7.2.1.1: both role attributes present is a conflict, and
+        // the error must not carry a mapped address.
+        let mut handler = BindingHandler::new();
+        handler.set_identity(identity_of(127, 0, 0, 1, 3478));
+        let live = transport::ConnectionId(7);
+        TBindingHandler::on_tcp_connect(&mut handler, live);
+
+        let conflicting = request(&[
+            ice_attr(protocol::AttrCode::IceControlled.as_u16(), [0, 0, 0, 0, 0, 0, 0, 1]),
+            ice_attr(protocol::AttrCode::IceControlling.as_u16(), [0, 0, 0, 0, 0, 0, 0, 2]),
+        ]);
+        handler.on_tcp_stun(&conflicting, conflicting.len(), live);
+
+        let Some(reply) = handler.queue_next() else {
+            panic!("a conflict must be answered, not dropped");
+        };
+        let msg = protocol::parse(&reply.payload).unwrap();
+        assert_eq!(msg.msg_type(), protocol::MessageType::BINDING_ERROR);
+        assert!(msg.xor_mapped_address().is_none(), "an error must not map");
+        assert_eq!(
+            msg.error().expect("ERROR-CODE").as_u16(),
+            binding::ErrorCode::RoleConflict.number()
+        );
+    }
+
+    #[test]
     fn render_plan_is_repeatable_for_the_same_plan() {
         let txid = protocol::TransactionId::from(TXID);
-        let plan = plan_for_request(&parsed(&[software_attr("x")]), None, None);
-        let a = render_plan(&plan, txid).unwrap();
-        let b = render_plan(&plan, txid).unwrap();
+        let default = default_identity();
+        let plan = plan_for_request(&parsed(&[software_attr("x")]), peer(), Some(default), &[default]);
+        let a = render_plan(&plan, txid, default).unwrap();
+        let b = render_plan(&plan, txid, default).unwrap();
         assert_eq!(a, b, "the render is a pure function of the plan");
         assert!(a.len() > protocol::HEADER_LEN);
+    }
+
+    #[test]
+    fn the_listen_list_deduplicates_and_grows_from_the_sockets() {
+        let mut handler = BindingHandler::new();
+        handler.set_addresses(vec![
+            identity_of(10, 0, 0, 1, 3478),
+            identity_of(10, 0, 0, 9, 3479),
+        ]);
+        handler.set_udp(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        let bound = handler.udp_identity.expect("the socket is bound");
+
+        // The listener list is what a CHANGE-REQUEST resolves against, and it
+        // must now hold the socket the handler actually sends from.
+        assert!(handler.addresses().contains(&identity_of(10, 0, 0, 1, 3478)));
+        assert!(handler.addresses().contains(&identity_of(10, 0, 0, 9, 3479)));
+        assert!(handler.addresses().contains(&bound));
+
+        // Adding the same address twice must not double it.
+        handler.set_tcp_identity(identity_of(10, 0, 0, 9, 3479));
+        assert_eq!(
+            handler.addresses().iter().filter(|id| **id == identity_of(10, 0, 0, 9, 3479)).count(),
+            1
+        );
+        assert_eq!(handler.addresses().len(), 3);
+    }
+
+    #[test]
+    fn an_address_list_of_two_honors_a_change_request_over_tcp() {
+        let mut handler = BindingHandler::new();
+        let live = transport::ConnectionId(9);
+        TBindingHandler::on_tcp_connect(&mut handler, live);
+
+        let listener = identity_of(127, 0, 0, 1, 3480);
+        let second = identity_of(127, 0, 0, 2, 3481);
+        handler.set_tcp_identity(listener);
+        handler.set_addresses(vec![listener, second]);
+
+        let datagram = request(&[change_attr(0x0000_0003)]);
+        handler.on_tcp_stun(&datagram, datagram.len(), live);
+
+        let Some(reply) = handler.queue_next() else {
+            panic!("a change request the listen list can satisfy must be answered");
+        };
+        let msg = protocol::parse(&reply.payload).unwrap();
+        assert_eq!(msg.msg_type(), protocol::MessageType::BINDING_SUCCESS);
+        let addr = msg.xor_mapped_address().expect("XOR-MAPPED-ADDRESS");
+        assert_eq!(addr.ipv4(), Some((127, 0, 0, 2)));
+        assert_eq!(addr.port, 3481);
     }
 }
