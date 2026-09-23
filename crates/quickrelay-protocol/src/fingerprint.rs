@@ -247,7 +247,7 @@ mod tests {
         // MESSAGE-INTEGRITY at 48 ends at 72, so FINGERPRINT is the 61st octet.
         // length 0x003c already correct.
         assert_eq!(attribute_offset(&RFC5769_2_2), Some(72));
-        assert_eq!(verify(&RFC5769_2_2, 72).is_ok(), true);
+        assert!(verify(&RFC5769_2_2, 72).is_ok());
         assert_eq!(Fingerprint::over(&RFC5769_2_2[..72]), Fingerprint::from_bytes([0xc0, 0x7d, 0x4c, 0x96]));
         // The value octets carry the CRC, so compute() reads them as zeros; it
         // must be run on a copy of the RFC vector with the value zeroed.

@@ -82,7 +82,7 @@ impl MappedAddress {
 
     /// The IPv6 address octets, when the family is IPv6.
     pub fn ipv6(&self) -> Option<[u8; 16]> {
-        (self.family == AddressFamily::Ipv6).then(|| self.ip)
+        (self.family == AddressFamily::Ipv6).then_some(self.ip)
     }
 
     /// Encode into a mapped-address value buffer. `out` must be long enough

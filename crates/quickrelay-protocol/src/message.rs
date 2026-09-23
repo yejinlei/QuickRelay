@@ -397,17 +397,17 @@ pub fn parse(datagram: &[u8]) -> Result<Message, Error> {
         // The MESSAGE-INTEGRITY-SHA256 length rule is structural, not a value
         // check: it must fail before the value is decoded, so a 3-octet tag is
         // reported as `MessageIntegritySha256Length`, not as a malformed value.
-        if code == MESSAGE_INTEGRITY_SHA256_CODE {
-            if !(value_len >= MESSAGE_INTEGRITY_SHA256_MIN_LEN
-                && value_len <= crate::integrity::MESSAGE_INTEGRITY_SHA256_LEN
-                && value_len % 4 == 0)
-            {
+        if code == MESSAGE_INTEGRITY_SHA256_CODE
+            && !((MESSAGE_INTEGRITY_SHA256_MIN_LEN
+                    ..=crate::integrity::MESSAGE_INTEGRITY_SHA256_LEN)
+                .contains(&value_len)
+                && value_len.is_multiple_of(4))
+        {
                 return Err(Error::attr(
                     ErrorKind::MessageIntegritySha256Length,
                     MESSAGE_INTEGRITY_SHA256_CODE,
                 ));
             }
-        }
         let value = &datagram[off + 4..off + 4 + value_len];
         let attr = parse_attribute_value(kind, value, &txid_bytes)?;
         match kind {
@@ -429,9 +429,10 @@ pub fn parse(datagram: &[u8]) -> Result<Message, Error> {
                     fingerprint_offset = Some(off);
                 }
                 AttrCode::MessageIntegritySha256 => {
-                    if !((value_len >= MESSAGE_INTEGRITY_SHA256_MIN_LEN
-                        && value_len <= crate::integrity::MESSAGE_INTEGRITY_SHA256_LEN)
-                        && value_len % 4 == 0)
+                    if !((MESSAGE_INTEGRITY_SHA256_MIN_LEN
+                            ..=crate::integrity::MESSAGE_INTEGRITY_SHA256_LEN)
+                        .contains(&value_len)
+                        && value_len.is_multiple_of(4))
                     {
                         return Err(Error::attr(
                             ErrorKind::MessageIntegritySha256Length,
@@ -700,7 +701,7 @@ mod tests {
     #[test]
     fn rfc5769_2_1_parses_byte_exact() {
         let msg = parse(&RFC5769_2_1).expect("2.1 must parse");
-        assert_eq!(&msg.datagram_bytes()[..], &RFC5769_2_1[..]);
+        assert_eq!(msg.datagram_bytes(), &RFC5769_2_1[..]);
         assert_eq!(msg.datagram_len(), 108);
         assert_eq!(msg.header().msg_type.bits(), 0x0001);
         assert_eq!(msg.header().message_length, 0x58);
@@ -1068,7 +1069,7 @@ mod tests {
         assert_eq!(txid.as_ref().len(), 12);
         assert!(*txid.as_bytes() == TXID_5769);
         assert!(txid == TransactionId::from_bytes(TXID_5769));
-        let _ = TransactionId::from(txid);
+        let _ = txid;
     }
 
     #[test]
@@ -1572,14 +1573,14 @@ mod tests {
         assert!(is_registered(kind));
         assert!(kind.is_known());
         let unknown_kind = AttributeKind::from_code(0x8005);
-        assert!(unknown_kind.is_known() == false);
+        assert!(!unknown_kind.is_known());
         assert!(is_comprehension_optional(unknown_kind));
         assert!(!is_registered(unknown_kind));
         assert_eq!(unknown_kind.code(), 0x8005);
         assert_eq!(unknown_kind.as_u16(), 0x8005);
         assert_eq!(u16::from(kind), 0x8028);
         assert_eq!(u16::from(AttributeKind::Unknown(0x000b)), 0x000b);
-        assert!(!is_trailer_only(AttributeKind::Known(AttrCode::MessageIntegritySha256)) == false);
+        assert!(is_trailer_only(AttributeKind::Known(AttrCode::MessageIntegritySha256)));
         assert!(is_trailer_only(AttributeKind::Known(AttrCode::MessageIntegrity)));
         assert!(is_trailer_only(AttributeKind::Known(AttrCode::MessageIntegritySha256)));
         assert!(!is_comprehension_optional(AttributeKind::Known(AttrCode::MessageIntegrity)));
@@ -1590,13 +1591,12 @@ mod tests {
         assert_eq!(pad_len(4), 0);
         assert_eq!(pad_len(5), 3);
         assert_eq!(crate::attribute::attr_size(9), 16);
-        assert_eq!(emit_attribute(
+        assert!(emit_attribute(
             &mut Vec::new(),
             AttributeKind::Known(AttrCode::Software),
             &b"short"[..]
         )
-        .is_ok(),
-        true
+        .is_ok()
         );
     }
 
@@ -1679,7 +1679,7 @@ mod tests {
         assert_eq!(static_bytes[..].len(), 108);
         assert!(parse_bytes(static_bytes.clone()).is_ok());
         let msg = parse_bytes(Bytes::copy_from_slice(&RFC5769_2_1[..])).unwrap();
-        assert_eq!(&msg.datagram_bytes()[..], &RFC5769_2_1[..]);
+        assert_eq!(msg.datagram_bytes(), &RFC5769_2_1[..]);
         let _ = msg.clone();
     }
 
