@@ -18,6 +18,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::time::{Duration, Instant};
 
 use quickrelay_binding as binding;
 use quickrelay_protocol as protocol;
@@ -35,6 +36,112 @@ const SOFTWARE_NAME: &str = "QuickRelay 0.1";
 /// rendered datagram for one connection; a handler that outruns this drops the
 /// newest reply rather than growing the buffer without bound.
 const REPLY_QUEUE_CAP: usize = 4096;
+
+/// How long a rendered Binding reply is kept so a retransmission can be
+/// answered with the identical datagram (RFC 5389 §7.3.1).
+///
+/// The value is a deployment choice, not an RFC-mandated one: RFC 5389
+/// §7.2.1 defines no server-side timeout at all, and the 500 ms RTO example
+/// it gives times a transaction out at 39 500 ms. 55 s sits past that, so a
+/// peer that has sent its whole retry schedule still finds the cache.
+const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(55);
+
+/// The largest replay cache the handler keeps. Binding replies are small, so
+/// this is a ceiling on state, not a target.
+const TRANSACTION_CACHE_CAP: usize = 4096;
+
+/// The transaction key: source address plus transaction identifier.
+///
+/// The RFC scopes a transaction to the peer it came from (RFC 5389 §5.2), so
+/// two peers that happen to pick the same transaction id must not collide here.
+/// `None` for a datagram peer, the control connection for ICE-TCP — two
+/// streams on one listener are distinct peers for this purpose.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TransactionKey {
+    peer: SocketAddr,
+    txid: [u8; 12],
+    connection: Option<transport::ConnectionId>,
+}
+
+/// One rendered reply kept for a transaction, so a retransmission is answered
+/// with the datagram that went out before.
+#[derive(Debug, Clone)]
+struct TransactionEntry {
+    datagram: Vec<u8>,
+    until: Instant,
+}
+
+/// Rendered replies indexed by their transaction. STUN has no request
+/// "in progress" state a server can reject against, so this map is where the
+/// idempotency RFC 5389 §7.3.1 requires lives: same request, same datagram.
+#[derive(Debug, Default)]
+struct TransactionCache {
+    entries: Vec<(TransactionKey, TransactionEntry)>,
+}
+
+impl TransactionCache {
+    /// The reply kept for `key`, if one is still valid. Not removed: a client
+    /// may retransmit several times before it sees an answer.
+    fn lookup(&mut self, key: &TransactionKey) -> Option<Vec<u8>> {
+        self.reap();
+        self.entries
+            .iter()
+            .find(|(stored, _)| stored == key)
+            .map(|(_, entry)| entry.datagram.clone())
+    }
+
+    /// Record a rendered reply under its transaction key.
+    fn insert(&mut self, key: TransactionKey, datagram: Vec<u8>) {
+        self.reap();
+        if let Some(entry) = self.entries.iter_mut().find(|(stored, _)| stored == &key) {
+            entry.1 = TransactionEntry {
+                datagram,
+                until: Instant::now() + TRANSACTION_TIMEOUT,
+            };
+            return;
+        }
+        if self.entries.len() >= TRANSACTION_CACHE_CAP {
+            self.reap_oldest();
+        }
+        self.entries.push((
+            key,
+            TransactionEntry {
+                datagram,
+                until: Instant::now() + TRANSACTION_TIMEOUT,
+            },
+        ));
+    }
+
+    /// How many transactions are cached, including the expired ones not yet
+    /// reaped. Tests use this to see the eviction cap.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is cached, expired or not.
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Drop entries past their expiry. Cheap enough to run per request: the
+    /// cache is bounded by [`TRANSACTION_CACHE_CAP`] and Binding traffic is
+    /// the only source of entries.
+    fn reap(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|(_, entry)| entry.until > now);
+    }
+
+    /// Evict the earliest-expiring entry: the cache is full and a new
+    /// transaction has to fit.
+    fn reap_oldest(&mut self) {
+        let Some(pos) = (0..self.entries.len()).min_by_key(|&i| self.entries[i].1.until) else {
+            return;
+        };
+        self.entries.remove(pos);
+    }
+}
 
 /// The path a rendered datagram goes back out on.
 ///
@@ -85,19 +192,20 @@ pub struct ServerBindingSink {
     /// The identity a `ChangeSource::Default` answer reports: the socket this
     /// reply actually leaves from.
     default_identity: binding::ServerIdentity,
+    /// The datagram the last plan rendered to, kept so the handler can file
+    /// it under the transaction for a retransmission.
+    rendered: Option<Vec<u8>>,
     /// A control-connection reply waiting for the loop to write it.
     queued: Option<transport::QueuedReply>,
 }
 
 impl ServerBindingSink {
     /// A sink that replies on `path` and reports `default_identity`.
-    fn for_path(
-        path: ReplyPath,
-        default_identity: binding::ServerIdentity,
-    ) -> Self {
+    fn for_path(path: ReplyPath, default_identity: binding::ServerIdentity) -> Self {
         ServerBindingSink {
             reply_path: path,
             default_identity,
+            rendered: None,
             queued: None,
         }
     }
@@ -105,6 +213,12 @@ impl ServerBindingSink {
     /// Whether this sink has a path that can deliver a reply.
     pub fn is_live(&self) -> bool {
         self.reply_path.is_live()
+    }
+
+    /// The datagram the plan rendered to, whether or not it was sent. `None`
+    /// when the reply could not be rendered.
+    pub fn rendered(&self) -> Option<&[u8]> {
+        self.rendered.as_deref()
     }
 
     /// Take a control-connection reply off the wire and into the handler's
@@ -135,9 +249,12 @@ impl binding::ResponseSink for ServerBindingSink {
             // the reply is the only correct thing to do if it ever does.
             return;
         };
+        self.rendered = Some(datagram.clone());
         match self.reply_path.send(datagram) {
-            Ok(q) => self.queued = q,
-            Err(_) => self.reply_path = ReplyPath::None,
+            Ok(queue) => self.queued = queue,
+            Err(_) => {
+                self.reply_path = ReplyPath::None
+            }
         }
     }
 }
@@ -175,7 +292,19 @@ fn plan_attributes(
             }
             attrs
         }
-        Outcome::Error(code) => vec![error_code_attr(code)],
+        Outcome::Error(code) => {
+            let mut attrs = vec![error_code_attr(code)];
+            // RFC 8489 Section 6.3.1: a 420 must name the attributes it
+            // rejected. Only 420 carries a list; `plan_attributes` is the one
+            // place that decides, so no other error code can grow it.
+            if matches!(plan.outcome, Outcome::Error(binding::ErrorCode::UnknownAttribute))
+                {
+                if let Some(codes) = &plan.unknown_attributes {
+                    attrs.push(protocol::Attribute::UnknownAttributes(codes.clone()));
+                }
+            }
+            attrs
+        }
     }
 }
 
@@ -275,21 +404,46 @@ pub fn extract_ice(msg: &protocol::Message) -> binding::IceAttributes {
     }
 }
 
+/// Direction 1: read `OTHER-ADDRESS` as its own fact. It is not part of
+/// [`binding::IceAttributes`] because the attribute is optional and the family
+/// check compares it against the socket the request arrived on, which only the
+/// OTHER-ADDRESS carries the MAPPED-ADDRESS layout (RFC 5780 Section 7.4,
+/// RFC 3489 Section 11.2.3), so the parsed value maps onto the decision's
+/// carrier field for field. Returns `None` when the peer sent none: the
+/// attribute is optional, so its absence is not an error.
+pub fn extract_other_address(msg: &protocol::Message) -> Option<binding::OtherAddress> {
+    let protocol::Attribute::OtherAddress(addr) = msg.find(protocol::AttrCode::OtherAddress.as_u16())?
+    else {
+        return None;
+    };
+    Some(binding::OtherAddress {
+        family: match addr.family {
+            protocol::AddressFamily::Ipv4 => binding::IpFamily::V4,
+            protocol::AddressFamily::Ipv6 => binding::IpFamily::V6,
+        },
+        port: addr.port,
+        address: addr.ip,
+    })
+}
+
 /// Direction 1: the attribute codes a Binding server must comprehend but
-/// cannot find here, as a list [`binding::decide`] turns into 388.
+/// cannot find here, as a list [`binding::decide`] turns into 420.
 ///
 /// A Binding server knows `binding::NOT_COMPREHENSION_REQUIRED` — the set it
-/// may ignore silently — plus `BINDING_KNOWN`, the ICE and echo attributes it
-/// reads and decides on. Every other attribute in a Binding request is a 388.
-/// `BINDING_KNOWN` is a separate constant rather than a field of the decision
-/// crate so the comprehension table stays exactly the one a Binding server
-/// may keep and still reject the rest. `codes` is the caller's scratch, so
-/// the result borrows it rather than the message, and the buffer stays on the
-/// stack.
-const BINDING_KNOWN: [u16; 3] = [
-    protocol::AttrCode::Software.as_u16(),      // 0x8022, echoed
-    protocol::AttrCode::IceControlled.as_u16(), // 0x8029, the role
-    protocol::AttrCode::IceControlling.as_u16(),// 0x802A, the role
+/// may ignore silently — plus `BINDING_KNOWN`, the echo, ICE and
+/// OTHER-ADDRESS attributes it reads and decides on. Every other attribute in
+/// a Binding request is a 420. `BINDING_KNOWN` is a separate constant rather
+/// than a field of the decision crate so the comprehension table stays exactly
+/// the one a Binding server may keep and still reject the rest. `codes` is
+/// the caller's scratch, so the result borrows it rather than the message,
+/// and the buffer stays on the stack.
+const BINDING_KNOWN: [u16; 4] = [
+    protocol::AttrCode::Software.as_u16(),       // 0x8022, echoed
+    protocol::AttrCode::IceControlled.as_u16(),  // 0x8029, the role
+    protocol::AttrCode::IceControlling.as_u16(), // 0x802A, the role
+    // 0x802C, comprehension-optional (RFC 5780 §7): a server may ignore it,
+    // but this one reads it, so it is known rather than unknown.
+    protocol::AttrCode::OtherAddress.as_u16(),
 ];
 
 fn unknown_attribute_codes<'buf>(
@@ -327,8 +481,8 @@ fn unknown_attribute_codes<'buf>(
 /// reply normally leaves from, and `addresses` every address this worker can
 /// send from — the full listen list `CHANGE-REQUEST` is resolved against.
 /// Without `addresses` a combined flag would always fail, so a worker that
-/// only knows its own socket answers from it and says 437 or 386 where the
-/// flag genuinely cannot be met.
+/// only knows its own socket answers 420 where the flag cannot be met (RFC
+/// 5780 §6.1 gives one error for every unsatisfiable CHANGE-REQUEST).
 pub fn plan_for_request(
     msg: &protocol::Message,
     peer: SocketAddr,
@@ -340,6 +494,7 @@ pub fn plan_for_request(
         peer,
         change: extract_change_request(msg),
         ice: extract_ice(msg),
+        other_address: extract_other_address(msg),
         software_requested: msg
             .find(protocol::AttrCode::Software.as_u16())
             .is_some(),
@@ -426,6 +581,9 @@ pub struct BindingHandler {
     conns: HashSet<transport::ConnectionId>,
     /// Replies queued for control connections, oldest first.
     outbox: VecDeque<transport::QueuedReply>,
+    /// Rendered replies kept so a retransmission answers with the same
+    /// datagram (RFC 5389 §7.3.1).
+    transactions: TransactionCache,
 }
 
 impl BindingHandler {
@@ -521,6 +679,42 @@ impl BindingHandler {
         }
     }
 
+    /// The transaction key for one UDP datagram: the peer it came from plus
+    /// its transaction identifier.
+    fn transaction_key(&self, raw: &[u8], txid: [u8; 12]) -> Option<TransactionKey> {
+        parse_peer_addr(raw).map(|peer| TransactionKey {
+            peer,
+            txid,
+            connection: None,
+        })
+    }
+
+    /// Deliver one datagram for a transaction and keep the exact bytes under
+    /// that transaction, so a retransmission is answered with the datagram
+    /// the peer already saw — a mapped address cannot change between answers.
+    fn deliver_reply(&mut self, path: &ReplyPath, key: &TransactionKey, datagram: Vec<u8>) {
+        if !path.is_live() {
+            return;
+        }
+        let Ok(sent) = path.send(datagram.clone()) else {
+            // The write failed; nothing reached the peer, so nothing is kept.
+            return;
+        };
+        // A control-connection reply has no wire yet: queue it for the loop.
+        if let Some(payload) = sent {
+            self.enqueue(payload);
+        }
+        self.transactions.insert(key.clone(), datagram);
+    }
+
+    /// File a rendered reply under its transaction: the sink has already put
+    /// it on the wire, so this only remembers the bytes.
+    fn filed(&mut self, sink: &ServerBindingSink, key: &TransactionKey) {
+        if let Some(rendered) = sink.rendered() {
+            self.transactions.insert(key.clone(), rendered.to_vec());
+        }
+    }
+
     /// Queue a reply, dropping it when the outbox is full.
     fn enqueue(&mut self, reply: transport::QueuedReply) {
         if self.outbox.len() >= REPLY_QUEUE_CAP {
@@ -549,14 +743,27 @@ impl transport::BindingHandler for BindingHandler {
             return;
         };
         let plan = plan_for_request(&msg, peer, Some(default_identity), self.addresses());
-        let mut sink = ServerBindingSink::for_path(
-            self.reply_path(src_addr),
-            default_identity,
-        );
-        binding::ResponseSink::send_plan(&mut sink, &plan, msg.transaction_id().into());
-        if let Some(reply) = sink.drain() {
-            self.enqueue(reply);
+        let txid = msg.transaction_id().into();
+        let Some(key) = self.transaction_key(src_addr, txid) else {
+            unreachable!("the peer was already parsed above")
+        };
+        let path = self.reply_path(src_addr);
+        // RFC 5389 §7.3.1: a request is either the first of a transaction or
+        // a retransmission, and the server MUST answer so that getting the
+        // retransmission's reply is equivalent to getting the original's. A
+        // cached reply is the exact bytes the peer already saw, which is the
+        // only way a different mapped address cannot leak between the two.
+        if path.is_live() {
+            if let Some(replay) = self.transactions.lookup(&key) {
+                self.deliver_reply(&path, &key, replay);
+                return;
+            }
         }
+        let mut sink = ServerBindingSink::for_path(path, default_identity);
+        binding::ResponseSink::send_plan(&mut sink, &plan, txid);
+        // The sink already sent; file the exact bytes under the transaction
+        // so a retransmission is answered with this same datagram.
+        self.filed(&sink, &key);
     }
 
     fn on_tcp_connect(&mut self, id: transport::ConnectionId) {
@@ -583,11 +790,23 @@ impl transport::BindingHandler for BindingHandler {
         // was made to, which is where the reply leaves from.
         let peer = default_identity.to_socket_addr();
         let plan = plan_for_request(&msg, peer, Some(default_identity), self.addresses());
+        // The connection id is part of the key: two streams on the same
+        // listener must not share a transaction cache entry.
+        let key = TransactionKey {
+            peer,
+            txid: msg.transaction_id().into(),
+            connection: Some(id),
+        };
+        if let Some(replay) = self.transactions.lookup(&key) {
+            self.deliver_reply(&ReplyPath::Tcp(id), &key, replay);
+            return;
+        }
         let mut sink = ServerBindingSink::for_path(ReplyPath::Tcp(id), default_identity);
         binding::ResponseSink::send_plan(&mut sink, &plan, msg.transaction_id().into());
         if let Some(reply) = sink.drain() {
             self.enqueue(reply);
         }
+        self.filed(&sink, &key);
     }
 
     fn on_tcp_error(&mut self, id: transport::ConnectionId) {
@@ -642,6 +861,25 @@ mod tests {
         protocol::Attribute::Software(name.to_string())
     }
 
+    /// An `OTHER-ADDRESS`, which carries the MAPPED-ADDRESS layout: an IPv4
+    /// address sits in the first four address octets, an IPv6 one in all
+    /// sixteen.
+    fn other_addr(is_ipv4: bool, address: [u8; 16], port: u16) -> protocol::Attribute {
+        if is_ipv4 {
+            protocol::Attribute::OtherAddress(protocol::MappedAddress::from_ipv4(
+                address[0],
+                address[1],
+                address[2],
+                address[3],
+                port,
+            ))
+        } else {
+            protocol::Attribute::OtherAddress(protocol::MappedAddress::from_ipv6(
+                address, port,
+            ))
+        }
+    }
+
     fn ice_attr(code: u16, tiebreaker: [u8; 8]) -> protocol::Attribute {
         if code == protocol::AttrCode::IceControlled.as_u16() {
             protocol::Attribute::IceControlled(tiebreaker)
@@ -673,6 +911,18 @@ mod tests {
     /// The worker's default listen identity.
     fn default_identity() -> binding::ServerIdentity {
         identity_of(10, 0, 0, 1, 3478)
+    }
+
+    /// The peer the transport hands the handler, encoded the way it comes
+    /// off the wire: four or sixteen address octets plus a big-endian port.
+    fn src_raw_of(addr: SocketAddr) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(6);
+        match addr.ip() {
+            IpAddr::V4(v4) => raw.extend_from_slice(&v4.octets()),
+            IpAddr::V6(v6) => raw.extend_from_slice(&v6.octets()),
+        }
+        raw.extend_from_slice(&addr.port().to_be_bytes());
+        raw
     }
 
     #[test]
@@ -721,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn an_ice_priority_on_a_binding_request_answers_388() {
+    fn an_ice_priority_on_a_binding_request_answers_420() {
         // ICE-PRIORITY belongs on a candidate check, not a control message:
         // the attribute is unknown to a Binding server.
         let default = default_identity();
@@ -730,12 +980,12 @@ mod tests {
         assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnknownAttribute));
         assert_eq!(
             plan.outcome.error().unwrap().number(),
-            388
+            420
         );
     }
 
     #[test]
-    fn an_attribute_the_binding_server_does_not_comprehend_answers_388() {
+    fn an_attribute_the_binding_server_does_not_comprehend_answers_420() {
         // USERNAME is a TURN attribute: a Binding server that meets it must
         // reject rather than ignore.
         let default = default_identity();
@@ -743,11 +993,59 @@ mod tests {
         let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
         assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnknownAttribute));
         assert!(!plan.include_xor_mapped);
+
+        // RFC 8489 Section 6.3.1 names the offending attribute, so a peer that
+        // keeps sending USERNAME learns which code to stop sending.
+        let unknowns = plan_attributes(&plan, default);
+        let protocol::Attribute::UnknownAttributes(codes) = unknowns.last().expect("list") else {
+            panic!("a 420 must carry UNKNOWN-ATTRIBUTES")
+        };
+        assert_eq!(codes, &[protocol::AttrCode::Username.as_u16()]);
+        let reply = protocol::parse(
+            &render_plan(&plan, protocol::TransactionId::from(TXID), default).unwrap(),
+        )
+        .unwrap();
+        let listed = reply
+            .find(protocol::AttrCode::UnknownAttributes.as_u16())
+            .and_then(|a| match a {
+                protocol::Attribute::UnknownAttributes(c) => Some(c.to_vec()),
+                _ => None,
+            })
+            .expect("the reply must carry UNKNOWN-ATTRIBUTES");
+        assert_eq!(listed, [protocol::AttrCode::Username.as_u16()]);
+
+        // Every other error code carries no attribute list: the 400 an
+        // OTHER-ADDRESS of the wrong family raises must stay a bare
+        // ERROR-CODE.
+        let other = other_addr(false, [0xffu8; 16], 50000);
+        let plan = plan_for_request(
+            &parsed(&[other]),
+            peer(),
+            Some(default),
+            &[default],
+        );
+        assert_eq!(plan.outcome.error().unwrap().number(), 400, "{plan:?}");
+        assert!(plan.unknown_attributes.is_none(), "{plan:?}");
+        assert!(
+            !plan_attributes(&plan, default)
+                .iter()
+                .any(|a| matches!(a, protocol::Attribute::UnknownAttributes(_)))
+        );
+    }
+
+    #[test]
+    fn an_other_address_of_the_connection_family_is_not_an_error() {
+        // The check is on the family only: a peer that names the family it is
+        // actually on is answered normally, not with the 400 the mismatch gets.
+        let default = default_identity();
+        let other = other_addr(true, [10, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 50000);
+        let plan = plan_for_request(&parsed(&[other]), peer(), Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Success, "{plan:?}");
     }
 
     #[test]
     fn a_clashing_ice_role_answers_role_conflict_487() {
-        // RFC 8445 §7.2.1.1: 487 Role Conflict, not the Unassigned 430.
+        // RFC 8445 §16.2: 487 Role Conflict, not the unassigned 430.
         let default = default_identity();
         let msg = parsed(&[
             ice_attr(protocol::AttrCode::IceControlled.as_u16(), [0, 0, 0, 0, 0, 0, 0, 1]),
@@ -768,33 +1066,37 @@ mod tests {
     }
 
     #[test]
-    fn a_change_request_no_candidate_satisfies_answers_437() {
+    fn a_change_request_no_candidate_satisfies_answers_420() {
         // `B` alone asks for the same address on a different port, and the
-        // listen list holds only the default: 437, with no mapped address.
+        // listen list holds only the default: no alternate address and port,
+        // so RFC 5780 Section 6.1's 420, with no mapped address.
         let default = default_identity();
         let msg = parsed(&[change_attr(0x0000_0002)]);
         let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
-        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnsupportedAddressFamily));
-        assert_eq!(plan.outcome.error().unwrap().number(), 437);
+        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
         assert!(!plan.include_xor_mapped);
 
         let bytes = render_plan(&plan, protocol::TransactionId::from(TXID), default).unwrap();
         let reply = protocol::parse(&bytes).unwrap();
         assert_eq!(reply.msg_type(), protocol::MessageType::BINDING_ERROR);
         let error = reply.error().expect("ERROR-CODE");
-        assert_eq!(error.as_u16(), binding::ErrorCode::UnsupportedAddressFamily.number());
-        assert_eq!(&error.reason, binding::ErrorCode::UnsupportedAddressFamily.reason().as_str().as_bytes());
+        assert_eq!(error.as_u16(), binding::ErrorCode::UnknownAttribute.number());
+        assert_eq!(
+            &error.reason,
+            binding::ErrorCode::UnknownAttribute.reason().as_str().as_bytes()
+        );
     }
 
     #[test]
-    fn a_combined_change_request_with_no_candidate_answers_386() {
-        // The IPv4 form of `A`|`B` is what the legacy CHANGE-ADDRESS meant, so
-        // the error is 386 Change-Address rather than 437.
+    fn a_combined_change_request_with_no_candidate_answers_420() {
+        // `A`|`B` asks for both dimensions to change; with one listener neither
+        // does, so the answer is the same 420 the port-only request got.
         let default = default_identity();
         let msg = parsed(&[change_attr(0x0000_0003)]);
         let plan = plan_for_request(&msg, peer(), Some(default), &[default]);
-        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::ChangeAddress));
-        assert_eq!(plan.outcome.error().unwrap().number(), 386);
+        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
     }
 
     #[test]
@@ -816,11 +1118,13 @@ mod tests {
     }
 
     #[test]
-    fn a_change_request_without_any_source_answers_437() {
-        // No default source and no listen list: a `B` request cannot be met.
+    fn a_change_request_without_any_source_answers_420() {
+        // No default source and no listen list: a `B` request cannot be met,
+        // and there is no socket at all to answer from, so no alternate.
         let msg = parsed(&[change_attr(0x0000_0002)]);
         let plan = plan_for_request(&msg, peer(), None, &[]);
-        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnsupportedAddressFamily));
+        assert_eq!(plan.outcome, Outcome::Error(binding::ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
 
         // A plain request still succeeds: there is no address to report, but
         // the sink supplies the socket it sends from.
@@ -852,14 +1156,12 @@ mod tests {
     #[test]
     fn every_decided_error_code_keeps_its_reason_phrase() {
         for code in [
+            binding::ErrorCode::TryAlternate,
             binding::ErrorCode::BadRequest,
             binding::ErrorCode::Unauthorized,
-            binding::ErrorCode::Forbidden,
             binding::ErrorCode::UnknownAttribute,
             binding::ErrorCode::StaleNonce,
-            binding::ErrorCode::UnsupportedAddressFamily,
             binding::ErrorCode::RoleConflict,
-            binding::ErrorCode::TooManyBindings,
             binding::ErrorCode::ServerError,
         ] {
             let attr = error_code_attr(code);
@@ -1175,4 +1477,161 @@ mod tests {
         assert_eq!(addr.ipv4(), Some((127, 0, 0, 2)));
         assert_eq!(addr.port, 3481);
     }
+
+    /// A request the handler has already answered, delivered from the same
+    /// peer with the same transaction id.
+    #[test]
+    fn a_retransmission_gets_the_same_datagram_over_udp() {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let mut handler = BindingHandler::new();
+        handler.set_udp(server.try_clone().unwrap());
+
+        let datagram = request(&[software_attr("replay me")]);
+        let src_raw = src_raw_of(client.local_addr().unwrap());
+        for _ in 0..3 {
+            client.send_to(&datagram, server_addr).unwrap();
+            let mut buf = vec![0u8; transport::MAX_UDP_DATAGRAM];
+            let (n, _) = server.recv_from(&mut buf).unwrap();
+            handler.on_stun(&buf[..n], n, &src_raw);
+        }
+
+        let mut first = vec![0u8; transport::MAX_UDP_DATAGRAM];
+        let (len, from) = client.recv_from(&mut first).unwrap();
+        assert_eq!(from, server_addr);
+        assert_eq!(handler.transactions.len(), 1, "one transaction, three replies");
+
+        let mut second = vec![0u8; transport::MAX_UDP_DATAGRAM];
+        let (len2, _) = client.recv_from(&mut second).unwrap();
+        let mut third = vec![0u8; transport::MAX_UDP_DATAGRAM];
+        let (len3, _) = client.recv_from(&mut third).unwrap();
+
+        // RFC 5389 §7.3.1: the reply to a retransmission must be equivalent to
+        // the original's, and the replay cache answers with the same bytes.
+        assert_eq!(first[..len], second[..len2], "second reply differs");
+        assert_eq!(second[..len2], third[..len3], "third reply differs");
+        let msg = protocol::parse(&first[..len]).unwrap();
+        assert_eq!(msg.msg_type(), protocol::MessageType::BINDING_SUCCESS);
+        assert!(
+            msg.find(protocol::AttrCode::Software.as_u16()).is_some(),
+            "the replayed reply keeps every attribute"
+        );
+    }
+
+    /// A retransmission over a control connection replays the queued datagram.
+    #[test]
+    fn a_retransmission_gets_the_same_datagram_over_tcp() {
+        let mut handler = BindingHandler::new();
+        handler.set_tcp_identity(identity_of(127, 0, 0, 1, 3478));
+        let id = transport::ConnectionId(21);
+        TBindingHandler::on_tcp_connect(&mut handler, id);
+
+        let datagram = request(&[]);
+        handler.on_tcp_stun(&datagram, datagram.len(), id);
+        let Some(first) = handler.queue_next() else {
+            panic!("the first request must be answered");
+        };
+        handler.on_tcp_stun(&datagram, datagram.len(), id);
+        let Some(second) = handler.queue_next() else {
+            panic!("a retransmission must be answered");
+        };
+        assert_eq!(first.payload, second.payload, "the retransmission is replayed");
+
+        handler.on_tcp_stun(&datagram, datagram.len(), id);
+        let Some(third) = handler.queue_next() else {
+            panic!("every retransmission is answered");
+        };
+        assert_eq!(first.payload, third.payload);
+        assert_eq!(handler.transactions.len(), 1);
+    }
+
+    /// Two streams on one listener never share a cache entry, even for the
+    /// same transaction id: the connection id is part of the key.
+    #[test]
+    fn two_streams_with_the_same_transaction_id_do_not_replay_each_others() {
+        let mut handler = BindingHandler::new();
+        handler.set_tcp_identity(identity_of(127, 0, 0, 1, 3478));
+        let a = transport::ConnectionId(30);
+        let b = transport::ConnectionId(31);
+        TBindingHandler::on_tcp_connect(&mut handler, a);
+        TBindingHandler::on_tcp_connect(&mut handler, b);
+
+        let same_txid = request(&[software_attr("a")]);
+        let mut diff_txid = same_txid.clone();
+        diff_txid[14] ^= 0xff;
+        diff_txid[15] ^= 0xff;
+
+        handler.on_tcp_stun(&same_txid, same_txid.len(), a);
+        handler.on_tcp_stun(&diff_txid, diff_txid.len(), b);
+        let ra = handler.queue_next().unwrap().payload;
+        let rb = handler.queue_next().unwrap().payload;
+        assert_ne!(ra, rb, "different streams, different replies");
+        assert_eq!(handler.transactions.len(), 2);
+
+        handler.on_tcp_stun(&same_txid, same_txid.len(), a);
+        handler.on_tcp_stun(&diff_txid, diff_txid.len(), b);
+        assert_eq!(handler.queue_next().unwrap().payload, ra);
+        assert_eq!(handler.queue_next().unwrap().payload, rb);
+    }
+
+    /// Expired and evicted entries are not replayed: the cache holds state,
+    /// and the state has a lifetime.
+    #[test]
+    fn expired_entries_are_not_replayed() {
+        let mut cache = TransactionCache::default();
+        let key = TransactionKey {
+            peer: "127.0.0.1:3478".parse().unwrap(),
+            txid: TXID,
+            connection: None,
+        };
+        cache.insert(key.clone(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert!(cache.lookup(&key).is_some(), "a fresh entry lives");
+
+        // Age the entry past the transaction timeout: after that the server is
+        // no longer answering for that transaction.
+        let mut entry = cache.entries.remove(0).1;
+        entry.until = Instant::now() - Duration::from_secs(1);
+        cache.entries.push((key.clone(), entry));
+        assert!(
+            cache.lookup(&key).is_none(),
+            "an expired entry is reaped, not replayed"
+        );
+        assert!(cache.is_empty(), "the reap dropped it");
+    }
+
+    /// A full cache evicts the earliest-expiring entry rather than growing.
+    #[test]
+    fn a_full_cache_evicts_the_oldest_entry() {
+        let mut cache = TransactionCache::default();
+        let key = |i: u64| TransactionKey {
+            peer: "127.0.0.1:3478".parse().unwrap(),
+            txid: {
+                let mut txid = [0u8; 12];
+                txid[..8].copy_from_slice(&i.to_le_bytes());
+                txid
+            },
+            connection: None,
+        };
+
+        for i in 0..TRANSACTION_CACHE_CAP as u64 {
+            cache.insert(key(i), vec![i as u8]);
+        }
+        assert_eq!(cache.len(), TRANSACTION_CACHE_CAP, "the cache fills");
+        assert!(cache.lookup(&key(0)).is_some(), "the first entry fits");
+
+        // Spread the expiries so the eviction target is unambiguous: the
+        // entry inserted first expires first.
+        for (n, entry) in cache.entries.iter_mut().enumerate() {
+            entry.1.until = Instant::now() + Duration::from_secs(n as u64 + 1);
+        }
+
+        // One more transaction evicts the earliest-expiring entry.
+        cache.insert(key(9000), vec![0xff]);
+        assert_eq!(cache.len(), TRANSACTION_CACHE_CAP, "the cap holds");
+        assert!(cache.lookup(&key(9000)).is_some(), "the newcomer is kept");
+        assert!(cache.lookup(&key(0)).is_none(), "the oldest is evicted");
+    }
 }
+

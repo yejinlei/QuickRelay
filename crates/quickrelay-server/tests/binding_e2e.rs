@@ -183,7 +183,7 @@ fn a_request_that_cannot_be_honored_gets_an_error_reply() {
     let code = msg.error().expect("ERROR-CODE");
     assert_eq!(
         code.as_u16(),
-        quickrelay_binding::ErrorCode::UnsupportedAddressFamily.number()
+        quickrelay_binding::ErrorCode::UnknownAttribute.number()
     );
 
     wake.wake();
@@ -214,13 +214,14 @@ fn a_software_request_is_echoed_back_over_tcp() {
 }
 
 #[test]
-fn a_combined_change_request_answers_386_not_437() {
+fn a_combined_change_request_answers_420() {
     let (wake, _udp, tcp) = start_worker(quiet_config());
 
     let mut peer = TcpStream::connect(tcp).unwrap();
     peer.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    // `A`|`B` over IPv4 is what CHANGE-ADDRESS meant, so the error row is
-    // 386 Change-Address, not the 437 that a family failure carries.
+    // `A`|`B` needs both dimensions to differ and there is no second
+    // listener: RFC 5780 Section 6.1 answers 420 for every unsatisfiable
+    // CHANGE-REQUEST, whichever family the peer uses.
     let request = build_response(
         MessageType::BINDING_REQUEST.bits(),
         &txid(),
@@ -237,7 +238,7 @@ fn a_combined_change_request_answers_386_not_437() {
     assert!(msg.xor_mapped_address().is_none(), "an error must not map");
     assert_eq!(
         msg.error().expect("ERROR-CODE").as_u16(),
-        quickrelay_binding::ErrorCode::ChangeAddress.number()
+        quickrelay_binding::ErrorCode::UnknownAttribute.number()
     );
 
     wake.wake();
@@ -249,8 +250,9 @@ fn both_ice_roles_answer_role_conflict_487() {
 
     let mut peer = TcpStream::connect(tcp).unwrap();
     peer.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    // RFC 8445 §7.2.1.1: a peer claiming both roles is a conflict, answered
-    // 487 Role Conflict. It is not 430, which IANA has not assigned.
+    // RFC 8445 §16.2 registers 487 (Role Conflict): a peer claiming both
+    // roles is a conflict. It is not 430, which no STUN error-code table
+    // assigns.
     let request = build_response(
         MessageType::BINDING_REQUEST.bits(),
         &txid(),
@@ -271,6 +273,10 @@ fn both_ice_roles_answer_role_conflict_487() {
     let error = msg.error().expect("ERROR-CODE");
     assert_eq!(error.as_u16(), quickrelay_binding::ErrorCode::RoleConflict.number());
     assert_eq!(error.as_u16(), 487, "the role conflict is 487, not 430");
+    assert_eq!(
+        &error.reason,
+        quickrelay_binding::ErrorCode::RoleConflict.reason().as_str().as_bytes()
+    );
 
     wake.wake();
 }
@@ -307,7 +313,7 @@ fn the_same_ice_roles_over_udp_also_answer_487() {
 fn a_change_request_against_a_second_listener_is_honored() {
     // A worker that listens on two addresses can honor the `B` bit: same
     // address, different port. Before this worker received the address list
-    // the same request answered 437, so this is the wiring test.
+    // the same request answered 420, so this is the wiring test.
     let listening = SocketAddr::from(([127, 0, 0, 1], 0));
     let config = quiet_config();
     let (mut worker, wake) = Worker::new(config, BindingHandler::new()).unwrap();
