@@ -315,7 +315,7 @@ mod tests {
         let facts = BindingRequestFacts {
             peer: peer_value(PEER),
             change: None,
-            ice: ice,
+            ice,
             other_address: None,
             software_requested: false,
             unknown_attributes: None,
@@ -337,7 +337,7 @@ mod tests {
         let facts = BindingRequestFacts {
             peer: peer_value(PEER),
             change: None,
-            ice: ice,
+            ice,
             other_address: None,
             software_requested: false,
             unknown_attributes: None,
@@ -354,7 +354,7 @@ mod tests {
         let facts = BindingRequestFacts {
             peer: peer_value(PEER),
             change: None,
-            ice: ice,
+            ice,
             other_address: None,
             software_requested: false,
             unknown_attributes: None,
@@ -367,12 +367,14 @@ mod tests {
     #[test]
     fn an_ice_priority_on_a_binding_request_is_unknown_attribute() {
         let default = listen_id(3478);
-        let mut ice = IceAttributes::default();
-        ice.priority = Some(0x6e00_01ff);
+        let ice = IceAttributes {
+            priority: Some(0x6e00_01ff),
+            ..ice_value(IceRole::default(), None)
+        };
         let facts = BindingRequestFacts {
             peer: peer_value(PEER),
             change: None,
-            ice: ice,
+            ice,
             other_address: None,
             software_requested: false,
             unknown_attributes: None,
@@ -600,7 +602,7 @@ mod tests {
         let facts = BindingRequestFacts {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0x0000_0001)),
-            ice: ice,
+            ice,
             other_address: None,
             software_requested: false,
             unknown_attributes: Some(&unknown),
@@ -615,7 +617,7 @@ mod tests {
         let facts = BindingRequestFacts {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0x0000_0001)),
-            ice: ice,
+            ice,
             other_address: None,
             software_requested: false,
             unknown_attributes: None,
