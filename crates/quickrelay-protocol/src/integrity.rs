@@ -243,7 +243,7 @@ pub fn verify(datagram: &[u8], attr_off: usize, algorithm: IntegrityAlgorithm, k
     Ok(())
 }
 
-fn hmac_of<'a>(len: usize, key: &[u8], msg: &'a [u8]) -> Vec<u8> {
+fn hmac_of(len: usize, key: &[u8], msg: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = if len == MESSAGE_INTEGRITY_SHA256_LEN {
         let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).unwrap_or_else(|_| {
             panic!("HMAC accepts keys of any length, including zero")
@@ -308,9 +308,9 @@ impl AttributeLocation {
         if self.code == 0x0008 && self.value_len == MESSAGE_INTEGRITY_LEN {
             Some(IntegrityAlgorithm::Sha1)
         } else if self.code == 0x001C
-            && self.value_len >= MESSAGE_INTEGRITY_SHA256_MIN_LEN
-            && self.value_len <= MESSAGE_INTEGRITY_SHA256_LEN
-            && self.value_len % 4 == 0
+            && (MESSAGE_INTEGRITY_SHA256_MIN_LEN..=MESSAGE_INTEGRITY_SHA256_LEN)
+                .contains(&self.value_len)
+            && self.value_len.is_multiple_of(4)
         {
             Some(IntegrityAlgorithm::Sha256)
         } else {
@@ -474,7 +474,7 @@ mod tests {
             msg[loc.off + 4..loc.off + 24].fill(0);
             let tag = compute(&mut msg, loc.off, IntegrityAlgorithm::Sha1, key).unwrap();
             assert_eq!(&tag[..20], &msg[loc.off + 4..loc.off + 24]);
-            assert_eq!(&msg[..], &original[..]);
+            assert_eq!(&msg[..], original);
         }
         let key = long_term_key(&USERNAME_UTF8, REALM, LONG_TERM_PASSWORD);
         let loc = locate(&RFC5769_2_4);
@@ -662,7 +662,7 @@ mod tests {
     fn hex(s: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(s.len() / 2);
         for pair in s.chunks(2) {
-            out.push(u8::from_str_radix(&std::str::from_utf8(pair).unwrap(), 16).unwrap());
+            out.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
         }
         out
     }

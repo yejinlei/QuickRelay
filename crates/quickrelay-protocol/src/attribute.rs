@@ -808,11 +808,11 @@ pub fn parse_attribute_value(
         AttrCode::ErrorCode => ErrorCode::read_value(buf).map(Attribute::ErrorCode),
         AttrCode::AddressErrorCode => ErrorCode::read_value(buf).map(Attribute::AddressErrorCode),
         AttrCode::UnknownAttributes => {
-            if buf.len() % 2 != 0 {
+            if !buf.len().is_multiple_of(2) {
                 return Err(err(ErrorKind::MalformedAttribute));
             }
             let mut out = Vec::with_capacity(buf.len() / 2);
-            for pair in buf.chunks_exact(2) {
+            for pair in buf.as_chunks::<2>().0 {
                 out.push(u16::from_be_bytes([pair[0], pair[1]]));
             }
             Ok(Attribute::UnknownAttributes(out))
@@ -827,9 +827,10 @@ pub fn parse_attribute_value(
             // RFC 8489 Section 14.7 permits a 16- to 32-octet value, in
             // multiples of four, so the tag is not fixed at 32 octets.
             let n = buf.len();
-            if !(n >= crate::message::MESSAGE_INTEGRITY_SHA256_MIN_LEN
-                && n <= MESSAGE_INTEGRITY_SHA256_LEN
-                && n % 4 == 0)
+            if !((crate::message::MESSAGE_INTEGRITY_SHA256_MIN_LEN
+                    ..=MESSAGE_INTEGRITY_SHA256_LEN)
+                .contains(&n)
+                && n.is_multiple_of(4))
             {
                 return Err(Error::attr(
                     ErrorKind::MalformedAttribute,
@@ -889,7 +890,7 @@ pub fn parse_attribute_value(
             // RFC 6062 Section 2.3.1: 0x4000-0xBFFF inclusive. The 2-octet RFFU
             // field must be zero on transmission and must be ignored on
             // reception, so it is discarded here.
-            if channel < 0x4000 || channel > 0xBFFF {
+            if !(0x4000..=0xBFFF).contains(&channel) {
                 return Err(err(ErrorKind::MalformedChannelNumber));
             }
             Ok(Attribute::ChannelNumber(channel))
@@ -978,11 +979,11 @@ pub fn parse_attribute_value(
 }
 
 fn write_str(out: &mut [u8], s: &str) -> Result<usize, Error> {
-    if out.len() < s.as_bytes().len() {
+    if out.len() < s.len() {
         return Err(Error::new(ErrorKind::ValueTooLong));
     }
-    out[..s.as_bytes().len()].copy_from_slice(s.as_bytes());
-    Ok(s.as_bytes().len())
+    out[..s.len()].copy_from_slice(s.as_bytes());
+    Ok(s.len())
 }
 
 fn write_exact(out: &mut [u8], src: &[u8]) -> Result<usize, Error> {
