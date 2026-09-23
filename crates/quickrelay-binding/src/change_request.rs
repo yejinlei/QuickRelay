@@ -60,7 +60,7 @@ impl ChangeRequest {
 
     /// Re-encode as the 32-bit attribute value.
     pub fn to_value(self) -> u32 {
-        (u32::from(self.change_ip) << 0) | (u32::from(self.change_port) << 1)
+        u32::from(self.change_ip) | (u32::from(self.change_port) << 1)
     }
 
     /// Neither bit is set: the request asks for nothing.
