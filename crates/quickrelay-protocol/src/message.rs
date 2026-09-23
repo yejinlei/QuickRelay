@@ -7,7 +7,7 @@
 //! value must obey the RFC 8489 Section 14.6 length rule.
 //!
 //! Unknown attribute handling follows RFC 8489 Section 6.3.1 (RFC 5389
-//! Section 13.4): a comprehension-required code (high bit clear) is an error
+//! Section 7.3): a comprehension-required code (high bit clear) is an error
 //! the caller must answer with error code `420 Unknown Attribute` carrying an
 //! `UNKNOWN-ATTRIBUTES` attribute; a comprehension-optional code (high bit
 //! set) is preserved in [`Message::unknown`] so the caller can echo it.
@@ -1241,9 +1241,7 @@ mod tests {
             .unknown_attribute_reply_type()
             .is_none());
         assert!(crate::attribute::error_code::unknown_attribute().to_string().starts_with("420"));
-        assert!(crate::attribute::error_code::legacy_unknown_attribute()
-            .to_string()
-            .starts_with("388"));
+        assert!(crate::attribute::error_code::stale_nonce().to_string().starts_with("438"));
     }
 
     #[test]

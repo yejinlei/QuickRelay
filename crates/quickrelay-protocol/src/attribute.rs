@@ -161,80 +161,63 @@ pub const fn is_trailer_only(kind: AttributeKind) -> bool {
     )
 }
 
-/// RFC 5389 Section 12.2 error codes, exposed for convenience.
+/// STUN error codes a message can carry, as ready-made [`ErrorCode`] values.
+///
+/// Only codes with a row in a published error-code table are offered here:
+/// the six STUN codes RFC 5389 Section 15.6 defines (300, 400, 401, 420, 438,
+/// 500), the ICE role conflict 487 that RFC 8445 Section 16.2 adds, and the
+/// TURN-only 508 that RFC 8656 Section 19 registers. 370, 386, 388 and 430
+/// appear in no current STUN error-code table -- 430 was RFC 3489's "Stale
+/// Credentials" and 386/388 were draft numbers that never made 5389 -- so
+/// there is no helper for them: a peer that still sends one is read through
+/// [`ErrorCode::read_value`], never written by this crate.
 pub mod error_code {
     use super::ErrorCode;
 
-    /// 300, Too Many Bindings.
-    pub fn too_many_bindings() -> ErrorCode {
-        ErrorCode { class: 3, number: 0, reason: b"Too Many Bindings".to_vec() }
-    }
-    /// 370, Stale Nonce.
-    pub fn stale_nonce() -> ErrorCode {
-        ErrorCode { class: 3, number: 70, reason: b"Stale Nonce".to_vec() }
-    }
-    /// 388, Unknown Attribute. The RFC 5389 Section 12.2 code, which RFC
-    /// 8489 Section 12.2 deprecated in favour of `420`; kept for reading
-    /// messages from RFC 5389-era peers (RFC 5769 Section 2.5 uses it).
-    pub fn legacy_unknown_attribute() -> ErrorCode {
-        ErrorCode { class: 3, number: 88, reason: b"Unknown Attribute".to_vec() }
+    /// 300, Try Alternate.
+    pub fn try_alternate() -> ErrorCode {
+        ErrorCode { class: 3, number: 0, reason: b"Try Alternate".to_vec() }
     }
     /// 400, Bad Request.
     pub fn bad_request() -> ErrorCode {
         ErrorCode { class: 4, number: 0, reason: b"Bad Request".to_vec() }
     }
-    /// 420, Unknown Attribute. The RFC 8489 Section 12.2 code, which obsoletes
-    /// the RFC 5389 code `388` that [`legacy_unknown_attribute`] retains.
+    /// 401, Unauthenticated. RFC 8489 renamed the registered phrase from
+    /// `Unauthorized` to `Unauthenticated`; the wire string follows it.
+    pub fn unauthenticated() -> ErrorCode {
+        ErrorCode { class: 4, number: 1, reason: b"Unauthenticated".to_vec() }
+    }
+    /// 420, Unknown Attribute.
     pub fn unknown_attribute() -> ErrorCode {
         ErrorCode { class: 4, number: 20, reason: b"Unknown Attribute".to_vec() }
     }
-    /// 401, Unauthorized.
-    pub fn unauthorized() -> ErrorCode {
-        ErrorCode { class: 4, number: 1, reason: b"Unauthorized".to_vec() }
+    /// 438, Stale Nonce.
+    pub fn stale_nonce() -> ErrorCode {
+        ErrorCode { class: 4, number: 38, reason: b"Stale Nonce".to_vec() }
     }
-    /// 438, Unsupported Address Family.
-    pub fn unsupported_address_family() -> ErrorCode {
-        ErrorCode { class: 4, number: 38, reason: b"Unsupported Address Family".to_vec() }
-    }
-    /// 439, Stale Credentials.
-    pub fn stale_credentials() -> ErrorCode {
-        ErrorCode { class: 4, number: 39, reason: b"Stale Credentials".to_vec() }
-    }
-    /// 480, Role Conflict.
+    /// 487, Role Conflict (RFC 8445 Section 16.2).
     pub fn role_conflict() -> ErrorCode {
-        ErrorCode { class: 4, number: 80, reason: b"Role Conflict".to_vec() }
-    }
-    /// 487, Allocation Mismatch.
-    pub fn allocation_mismatch() -> ErrorCode {
-        ErrorCode { class: 4, number: 87, reason: b"Allocation Mismatch".to_vec() }
-    }
-    /// 488, Unsupported Transport.
-    pub fn unsupported_transport() -> ErrorCode {
-        ErrorCode { class: 4, number: 88, reason: b"Unsupported Transport".to_vec() }
+        ErrorCode { class: 4, number: 87, reason: b"Role Conflict".to_vec() }
     }
     /// 500, Server Error.
     pub fn server_error() -> ErrorCode {
         ErrorCode { class: 5, number: 0, reason: b"Server Error".to_vec() }
     }
-    /// 508, Out of Resources.
-    pub fn out_of_resources() -> ErrorCode {
-        ErrorCode { class: 5, number: 8, reason: b"Out of Resources".to_vec() }
+    /// 508, Insufficient Capacity (RFC 8656 Section 19, TURN).
+    pub fn insufficient_capacity() -> ErrorCode {
+        ErrorCode { class: 5, number: 8, reason: b"Insufficient Capacity".to_vec() }
     }
-    /// 538, Unsupported Address Family.
-    pub fn turn_unsupported_address_family() -> ErrorCode {
-        ErrorCode { class: 5, number: 38, reason: b"Unsupported Address Family".to_vec() }
-    }
-    /// 539, Connection ID Conflicts.
-    pub fn connection_id_conflicts() -> ErrorCode {
-        ErrorCode { class: 5, number: 39, reason: b"Connection ID Conflicts".to_vec() }
-    }
-    /// 601, Forwards Forbidden.
-    pub fn forwards_forbidden() -> ErrorCode {
-        ErrorCode { class: 6, number: 1, reason: b"Forwards Forbidden".to_vec() }
-    }
-    /// 603, Forbidden (RFC 7635 third-party authorization rejected).
+    /// 403, Forbidden (RFC 8656 Section 19, TURN).
     pub fn forbidden() -> ErrorCode {
-        ErrorCode { class: 6, number: 3, reason: b"Forbidden".to_vec() }
+        ErrorCode { class: 4, number: 3, reason: b"Forbidden".to_vec() }
+    }
+    /// 440, Address Family not Supported (RFC 8656 Section 19, TURN).
+    pub fn address_family_not_supported() -> ErrorCode {
+        ErrorCode {
+            class: 4,
+            number: 40,
+            reason: b"Address Family not Supported".to_vec(),
+        }
     }
 }
 
@@ -275,7 +258,7 @@ pub enum AttrCode {
     MessageIntegrity,
     /// 0x0009, ERROR-CODE (RFC 5389 Section 12).
     ErrorCode,
-    /// 0x000A, UNKNOWN-ATTRIBUTES (RFC 5389 Section 13.4).
+    /// 0x000A, UNKNOWN-ATTRIBUTES (RFC 5389 Section 15.9).
     UnknownAttributes,
     /// 0x000C, CHANNEL-NUMBER (RFC 8656 Section 2.3.1).
     ChannelNumber,
@@ -341,7 +324,7 @@ pub enum AttrCode {
     IceControlled,
     /// 0x802A, ICE-CONTROLLING (RFC 8445 Section 6.1.2).
     IceControlling,
-    /// 0x802C, OTHER-ADDRESS (RFC 5780 Section 6.1).
+    /// 0x802C, OTHER-ADDRESS (RFC 5780 Section 7.4).
     OtherAddress,
     /// 0x802E, THIRD-PARTY-AUTHORIZATION (RFC 7635 Section 4.1).
     ThirdPartyAuthorization,
@@ -459,8 +442,7 @@ impl AttrCode {
             AttrCode::MappedAddress
             | AttrCode::XorMappedAddress
             | AttrCode::XorRelayedAddress
-            | AttrCode::XorPeerAddress
-            | AttrCode::OtherAddress => Some(8),
+            | AttrCode::XorPeerAddress => Some(8),
             AttrCode::MessageIntegrity => Some(MESSAGE_INTEGRITY_LEN),
             AttrCode::MessageIntegritySha256 => Some(MESSAGE_INTEGRITY_SHA256_LEN),
             AttrCode::UserHash => Some(USERHASH_LEN),
@@ -474,6 +456,7 @@ impl AttrCode {
             AttrCode::Data => Some(DATA_MAX_LEN),
             AttrCode::ErrorCode
             | AttrCode::AlternateServer
+            | AttrCode::OtherAddress
             | AttrCode::UnknownAttributes
             | AttrCode::Username
             | AttrCode::Realm
@@ -941,7 +924,11 @@ pub fn parse_attribute_value(
         }
         AttrCode::AlternateServer => read_alternate_server(buf).map(Attribute::AlternateServer),
         AttrCode::OtherAddress => {
-            check_exact(code, buf, 8)?;
+            // RFC 5780 Section 7.4 keeps RFC 3489's CHANGED-ADDRESS number
+            // under a new name, and RFC 3489 Section 11.2.3 calls that
+            // attribute's syntax "identical to MAPPED-ADDRESS": 8 octets for
+            // IPv4, 20 for IPv6. `MappedAddress::read_value` checks both the
+            // family and the length that family implies, so no guard here.
             MappedAddress::read_value(buf).map(Attribute::OtherAddress)
         }
         AttrCode::ReservationToken | AttrCode::EvenPort | AttrCode::AccessToken
@@ -1035,10 +1022,14 @@ pub fn write_attribute_value(
         Attribute::ErrorCode(e) => e.write_value(out),
         Attribute::AddressErrorCode(e) => e.write_value(out),
         Attribute::UnknownAttributes(list) => {
-            if u32::try_from(list.len()).is_err() {
+            // Two octets per code, and no padding: the length field records the
+            // real value length (RFC 8489 Section 3.1) and
+            // [`emit_attribute`] pads the frame to the 4-octet boundary. A
+            // padded length here would make the next attribute read four
+            // attribute types instead of two.
+            let Some(n) = list.len().checked_mul(2).filter(|n| u32::try_from(*n).is_ok()) else {
                 return Err(Error::new(ErrorKind::ValueTooLong));
-            }
-            let n = padded_len(list.len() * 2);
+            };
             if out.len() < n {
                 return Err(Error::new(ErrorKind::ValueTooLong));
             }
@@ -1358,24 +1349,49 @@ mod tests {
     }
 
     #[test]
-    fn error_code_helpers_are_correct() {
-        assert_eq!(error_code::too_many_bindings().as_u16(), 300);
-        assert_eq!(error_code::stale_nonce().as_u16(), 370);
-        assert_eq!(error_code::unknown_attribute().as_u16(), 420);
-        assert_eq!(error_code::legacy_unknown_attribute().as_u16(), 388);
-        assert_eq!(error_code::bad_request().as_u16(), 400);
-        assert_eq!(error_code::unauthorized().as_u16(), 401);
-        assert_eq!(error_code::unsupported_address_family().as_u16(), 438);
-        assert_eq!(error_code::stale_credentials().as_u16(), 439);
-        assert_eq!(error_code::role_conflict().as_u16(), 480);
-        assert_eq!(error_code::allocation_mismatch().as_u16(), 487);
-        assert_eq!(error_code::unsupported_transport().as_u16(), 488);
-        assert_eq!(error_code::server_error().as_u16(), 500);
-        assert_eq!(error_code::out_of_resources().as_u16(), 508);
-        assert_eq!(error_code::turn_unsupported_address_family().as_u16(), 538);
-        assert_eq!(error_code::connection_id_conflicts().as_u16(), 539);
-        assert_eq!(error_code::forwards_forbidden().as_u16(), 601);
-        assert_eq!(error_code::forbidden().as_u16(), 603);
+    fn error_code_helpers_are_the_assigned_values() {
+        // Each helper is a row of a published table: 300/400/401/420/438/500
+        // are RFC 5389 Section 15.6, 487 is RFC 8445 Section 16.2, and the
+        // 4xx/5xx codes marked TURN are RFC 8656 Section 19.
+        let codes = [
+            (error_code::try_alternate(), 300),
+            (error_code::bad_request(), 400),
+            (error_code::unauthenticated(), 401),
+            (error_code::unknown_attribute(), 420),
+            (error_code::stale_nonce(), 438),
+            (error_code::role_conflict(), 487),
+            (error_code::server_error(), 500),
+            (error_code::server_error(), 500),
+            (error_code::insufficient_capacity(), 508),
+            (error_code::forbidden(), 403),
+            (error_code::address_family_not_supported(), 440),
+        ];
+        for (code, number) in codes {
+            assert_eq!(code.as_u16(), number);
+        }
+        assert_eq!(
+            error_code::unauthenticated().reason,
+            b"Unauthenticated".to_vec()
+        );
+    }
+
+    #[test]
+    fn there_is_no_helper_for_a_code_no_table_defines() {
+        // 370, 386, 388 and 430 are absent from the helpers for a reason: a
+        // code with no table row must not be one call away. 386 and 388 are
+        // not in RFC 5389 Section 15.6 at all, and 430 was RFC 3489's "Stale
+        // Credentials".
+        let codes = [error_code::try_alternate(), error_code::bad_request(),
+                     error_code::unauthenticated(), error_code::unknown_attribute(),
+                     error_code::stale_nonce(), error_code::role_conflict(),
+                     error_code::server_error(), error_code::insufficient_capacity(),
+                     error_code::forbidden(),
+                     error_code::address_family_not_supported()];
+        for code in codes {
+            for retired in [370u16, 386, 388, 430] {
+                assert_ne!(code.as_u16(), retired);
+            }
+        }
     }
 
     #[test]
@@ -1710,9 +1726,36 @@ mod tests {
             parse_attribute_value(AttributeKind::Known(AttrCode::OtherAddress), &value, &TXID).unwrap(),
             Attribute::OtherAddress(a)
         );
+
+        // The IPv6 form is 20 octets. An 8-octet length guard used to reject
+        // it, so a peer sending a valid OTHER-ADDRESS over an IPv6 connection
+        // would have been answered with a parse failure.
+        let v6 = MappedAddress::from_ipv6([0xff; 16], 60000);
+        let mut value6 = [0u8; 20];
+        v6.write_value(&mut value6).unwrap();
         assert_eq!(
-            parse_attribute_value(AttributeKind::Known(AttrCode::OtherAddress), &[0u8; 7], &TXID).unwrap_err().kind,
-            ErrorKind::MalformedAttribute
+            parse_attribute_value(
+                AttributeKind::Known(AttrCode::OtherAddress),
+                &value6,
+                &TXID,
+            )
+            .unwrap(),
+            Attribute::OtherAddress(v6)
+        );
+
+        // Family IPv4 with only 4 octets present: the value is shorter than
+        // that family requires.
+        let mut bad = [0u8; 4];
+        bad[1] = 0x01;
+        assert_eq!(
+            parse_attribute_value(
+                AttributeKind::Known(AttrCode::OtherAddress),
+                &bad,
+                &TXID,
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::MalformedAddress
         );
     }
 
@@ -1841,7 +1884,7 @@ mod tests {
         assert_eq!(AttrCode::XorMappedAddress.fixed_len(), Some(8));
         assert_eq!(AttrCode::XorRelayedAddress.fixed_len(), Some(8));
         assert_eq!(AttrCode::XorPeerAddress.fixed_len(), Some(8));
-        assert_eq!(AttrCode::OtherAddress.fixed_len(), Some(8));
+        assert_eq!(AttrCode::OtherAddress.fixed_len(), None);
         assert_eq!(AttrCode::MessageIntegrity.fixed_len(), Some(20));
         assert_eq!(AttrCode::MessageIntegritySha256.fixed_len(), Some(32));
         assert_eq!(AttrCode::UserHash.fixed_len(), Some(32));

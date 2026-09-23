@@ -375,8 +375,9 @@ impl MessageType {
     }
 
     /// Whether a `420 Unknown Attribute` reply can be sent for a message of
-    /// this type, per RFC 8489 Section 6.3.1 (RFC 5389 Section 13.4 says the
-    /// same for error code `388`, which RFC 8489 renumbered to `420`).
+    /// this type, per RFC 8489 Section 6.3.1; RFC 5389 Section 7.3.1 says the
+    /// same for requests, which it answers with the code its Section 15.6
+    /// table assigns to it, 420.
     pub const fn can_reply_420(self) -> bool {
         !self.class.is_response() && !self.class.is_indication()
     }
@@ -386,7 +387,7 @@ impl MessageType {
     ///
     /// The reply carries an UNKNOWN-ATTRIBUTES *attribute* (code `0x000A`)
     /// listing the offending codes; it is not itself a separate method. Both
-    /// RFC 8489 Section 6.3.1 and RFC 5389 Section 13.4 specify the error
+    /// RFC 8489 Section 6.3.1 and RFC 5389 Section 7.3.1 specify the error
     /// class with the method number of the request that carried the unknown
     /// attribute, so a reply to a Binding request is a Binding error.
     pub const fn unknown_attribute_reply_type(self) -> Option<Self> {

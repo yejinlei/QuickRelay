@@ -39,8 +39,10 @@ pub enum ErrorKind {
     InvalidUtf8,
     /// The same attribute appears twice (RFC 3084 Section 5).
     DuplicateAttribute,
-    /// An unknown comprehension-required attribute was received; RFC 5389
-    /// Section 13.4 mandates replying 388 and discarding the request.
+    /// An unknown comprehension-required attribute was received. RFC 5389
+    /// Section 7.3 checks for those and Section 15.6 answers them with
+    /// 420 (Unknown Attribute); requests are retransmitted by the client, so
+    /// a reply must be sent rather than the request discarded.
     UnknownRequired,
     /// The message claims to carry MESSAGE-INTEGRITY but does not.
     MissingMessageIntegrity,
