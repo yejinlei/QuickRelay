@@ -13,7 +13,10 @@ repository.workspace = true
 # See docs/architecture/workspace-layout.md section 2.3.
 [dependencies]
 socket2 = { workspace = true }
-mio = { workspace = true }
+# `mio` ships the socket wrappers behind the `net` feature and `Poll::new` /
+# `Events::with_capacity` behind `os-poll`; the workspace line enables neither,
+# so both are listed here. Features are additive, so the workspace entry stays.
+mio = { workspace = true, features = ["net", "os-poll"] }
 bytes = { workspace = true }
 
 [dev-dependencies]

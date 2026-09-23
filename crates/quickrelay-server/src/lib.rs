@@ -11,8 +11,4 @@
 //! the two-way mapping between `protocol` attributes and `binding` value
 //! types is allowed in exactly that one file.
 
-/// Placeholder module so the library target compiles before YEJ-141 lands.
-pub mod skeleton {
-    /// Skeleton marker. Replaced by `binding_chain` in YEJ-141.
-    pub const SKELETON: &str = "quickrelay-server skeleton — replaced by YEJ-141";
-}
+pub mod binding_chain;
