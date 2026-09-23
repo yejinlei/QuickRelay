@@ -7,19 +7,18 @@
 //!
 //! Checks run in the order a peer can observe them, so a request that
 //! fails more than one check always gets the same answer:
-//! 1. attributes it must understand but does not -- 388
+//! 1. attributes it must understand but does not -- 420
 //! 2. a malformed or conflicting ICE role -- 487 / 400
-//! 3. CHANGE-REQUEST resolution -- 437 / 386
-//! 4. rate limits -- 486
-//! 5. otherwise success, with whatever the peer asked the server to echo
+//! 3. CHANGE-REQUEST resolution -- 420
+//! 4. otherwise success, with whatever the peer asked the server to echo
 //!
 //! # What is deliberately not here
-//!//! * **Transaction tables.** `370 REQUEST ALREADY IN PROGRESS` is Unassigned
-//!   in IANA and the concept does not exist in STUN: RFC 5389 Section
-//!   7.1.2 requires a server that receives a duplicate request within a
-//!   transaction lifetime to send its answer again, not to reject it.
-//!   Duplicate handling is `quickrelay-server`'s transaction bookkeeping, not a
-//!   decision.
+//! * **Transaction tables.** There is no "request already in progress" error
+//!   to decide here, and none of 370, 390 or 430 has a row in any STUN
+//!   error-code table. RFC 5389 Section 7.3.1 requires a server that receives
+//!   a duplicate request within a transaction lifetime to send its answer
+//!   again, not to reject it, so a duplicate is a cache hit and not a decision:
+//!   it is `quickrelay-server`'s transaction cache, not a plan.
 //! * **Authentication.** Nonce staleness (438) needs a nonce the server
 //!   issued and a clock; both live in `quickrelay-auth` (Stage 3).
 //! * **Framing.** ICE-TCP and TURN-over-TCP framing is owned by
@@ -30,16 +29,30 @@ use std::net::SocketAddr;
 
 use crate::change_request::{ChangeRequest, ChangeResponseAction};
 use crate::error_codes::ErrorCode;
-use crate::ice::{IceAttributes, IceValidation, IpFamily};
+use crate::ice::{IceAttributes, IceValidation, OtherAddress, IpFamily};
 use crate::response::{BindingResponsePlan, ChangeSource, Outcome, ServerIdentity};
 
-/// Attribute codes a server MAY ignore without answering `388` (RFC 5389
-/// Section 5.1).
+/// Attribute codes the server may ignore without answering 420, because the
+/// server has no use for them: they describe the connection or the request
+/// itself rather than something the server must act on.
 ///
-/// Any unknown attribute *not* in this list must produce
-/// [`ErrorCode::UnknownAttribute`]. The legacy `CHANGE-ADDRESS` (`0x0005`),
-/// `CHANGE-IP` (`0x0004`) and `CHANGE-PORT` (`0x0006`) are not listed here, so
-/// they are rejected -- a peer still sending them is running pre-RFC 5389.
+/// The list is deliberately conservative. RFC 5389 Section 7.3 does not
+/// publish a global allowlist; it says comprehension-*optional* attributes
+/// (`0x8000-0xFFFF`) may be ignored, and that a server *should* ignore a
+/// comprehension-*required* attribute it does not expect. What a Binding
+/// server ignores, therefore, is a property of this server and is stated here
+/// next to the 420 decision it gates, rather than derived from a registry
+/// constant.
+///
+/// Everything not listed here must produce [`ErrorCode::UnknownAttribute`]
+/// (420) and be named in the reply's `UNKNOWN-ATTRIBUTES` attribute
+/// (RFC 8489 Section 14.8). That includes the legacy `CHANGE-ADDRESS`
+/// (`0x0005`), `CHANGE-IP` (`0x0004`) and `CHANGE-PORT` (`0x0006`) and the
+/// `CHANGE-REQUEST` slot itself: RFC 8489 Section 18.3.1 records `0x0003` as
+/// `Reserved; was CHANGE-REQUEST prior to [RFC5389]`, so under 8489 a peer
+/// that still sends it is out of date and gets 420. `quickrelay-server`
+/// supplies the codes, so whether `0x0003` is honored is a decision the caller
+/// makes by omitting it from the unknown list, not a constant here.
 pub const NOT_COMPREHENSION_REQUIRED: [u16; 5] = [
     0x0001, // MAPPED-ADDRESS
     0x8000, // RESPONSE-ADDRESS
@@ -59,6 +72,12 @@ pub struct BindingRequestFacts<'a> {
     pub change: Option<ChangeRequest>,
     /// The parsed ICE attribute set.
     pub ice: IceAttributes,
+    /// The request named its own address in `OTHER-ADDRESS`, when present.
+    ///
+    /// Carried as the parsed value rather than the wire body: the family
+    /// mismatch that 400 answers is a property of the address, and
+    /// `quickrelay-server` is the side that reads it off the message.
+    pub other_address: Option<OtherAddress>,
     /// The request carried `SOFTWARE` (`0x8022`), so the reply must echo it.
     pub software_requested: bool,
     /// Codes of attributes the server does not comprehend, `None` when the
@@ -84,20 +103,42 @@ pub fn decide(
 ) -> BindingResponsePlan {
     // 1. Attributes the server does not understand.
     if let Some(unknown) = facts.unknown_attributes {
-        let must_reject = unknown
+        // RFC 8489 Section 6.3.1: the 420 must list the unknown
+        // comprehension-required attributes it met. Only the codes that
+        // actually rejected the request are named here, so a comprehension-
+        // optional code the server ignores is never reported as unknown.
+        let rejecting: Vec<u16> = unknown
             .iter()
-            .any(|code| !NOT_COMPREHENSION_REQUIRED.contains(code));
-        if must_reject {
-            return BindingResponsePlan::error(ErrorCode::UnknownAttribute);
+            .copied()
+            .filter(|code| !NOT_COMPREHENSION_REQUIRED.contains(code))
+            .collect();
+        if !rejecting.is_empty() {
+            return BindingResponsePlan::error(ErrorCode::UnknownAttribute)
+                .with_unknown_attributes(&rejecting);
         }
     }
 
-    // 2. ICE validation: a role conflict is 487, a malformed role attribute is
-    // 400, an OTHER-ADDRESS family mismatch is 437.
+    // 2. ICE validation: a role conflict is 487, a malformed role attribute
+    // or an OTHER-ADDRESS family mismatch is 400. The family is the socket the
+    // request arrived on, so it is read once and shared by both checks.
     let family = match facts.peer {
         SocketAddr::V4(_) => IpFamily::V4,
         SocketAddr::V6(_) => IpFamily::V6,
     };
+    // OTHER-ADDRESS names the peer's own address on this connection, so a
+    // family it names different from the one the request arrived on means the
+    // request does not describe the connection it is on: 400. It is a 400 and
+    // not a 420 because the server does comprehend the attribute -- it reads
+    // the family field and compares it with the socket, so the check is on the
+    // value, not on the code point.
+    if let Some(other) = facts.other_address {
+        let check = crate::ice::validate_other_address(&other, family);
+        if !matches!(check, IceValidation::Ok) {
+            // `WrongFamily` is the only arm that check can return, and the
+            // error table already pairs it with 400.
+            return BindingResponsePlan::error(check.error().expect("non-Ok carries a code"));
+        }
+    }
     if let Some(code) = validate_ice(&facts.ice, family) {
         return BindingResponsePlan::error(code);
     }
@@ -111,9 +152,10 @@ pub fn decide(
     // 4. CHANGE-REQUEST.
     let change = facts.change.unwrap_or_default();
     let Some(default) = source else {
-        // No default source means no socket at all to answer from.
+        // No default source means no socket at all to answer from, so there
+        // is no alternate address and port either: 420 (RFC 5780 Section 6.1).
         if change.is_some() {
-            return BindingResponsePlan::error(ErrorCode::UnsupportedAddressFamily);
+            return BindingResponsePlan::error(ErrorCode::UnknownAttribute);
         }
         return BindingResponsePlan::success(ChangeSource::Default)
             .with_software(facts.software_requested);
@@ -152,8 +194,8 @@ mod tests {
     use super::*;
     use crate::error_codes::ReasonPhrase;
     use crate::ice::{
-        other_address_from_bytes, validate_other_address, IceAttributes, IceRole, IceTiebreaker,
-        IceValidation, IpFamily,
+        other_address_from_value, validate_other_address, IceAttributes, IceRole, IceTiebreaker,
+        IceValidation, IpFamily, OtherAddress,
     };
     use std::net::SocketAddr;
 
@@ -191,6 +233,7 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
@@ -205,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_attribute_must_be_rejected_with_388() {
+    fn an_unknown_attribute_must_be_rejected_with_420() {
         let default = listen_id(3478);
         // 0x0005 is the legacy CHANGE-ADDRESS / CHANGED-ADDRESS code point.
         let unknown = [0x0005u16];
@@ -213,13 +256,14 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: Some(&unknown),
             redirect_to: None,
         };
         let plan = decide(&facts, Some(default), &[default]);
         assert_eq!(plan.outcome, Outcome::Error(ErrorCode::UnknownAttribute));
-        assert_eq!(plan.outcome.error().unwrap().number(), 388);
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
         assert!(!plan.include_xor_mapped);
     }
 
@@ -233,6 +277,7 @@ mod tests {
             let facts = BindingRequestFacts {
                 peer: peer_value(PEER),
                 change: None,
+                other_address: None,
                 ice: IceAttributes::default(),
                 software_requested: false,
                 unknown_attributes: Some(&unknown),
@@ -254,6 +299,7 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: Some(&NOT_COMPREHENSION_REQUIRED),
             redirect_to: None,
@@ -270,6 +316,7 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: ice,
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
@@ -291,6 +338,7 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: ice,
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
@@ -307,6 +355,7 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: ice,
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
@@ -324,6 +373,7 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: ice,
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
@@ -339,6 +389,7 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: true,
             unknown_attributes: None,
             redirect_to: None,
@@ -353,6 +404,7 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: true,
             unknown_attributes: Some(&unknown),
             redirect_to: None,
@@ -369,6 +421,7 @@ mod tests {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0x0000_0003)),
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
@@ -381,16 +434,17 @@ mod tests {
     }
 
     #[test]
-    fn an_unhonorably_requested_change_answers_437() {
-        // `A`|`B` against an IPv6 peer: the combined row must differ in both
-        // dimensions, and there is no second listener. 437 is the error for a
-        // flag the family cannot carry.
+    fn an_unhonorably_requested_change_answers_420() {
+        // `A`|`B` with only one listener: both dimensions must differ and no
+        // second address exists. RFC 5780 Section 6.1 defines a single error
+        // for this, and it is 420.
         let default =
             ServerIdentity::ipv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 1], 3478);
         let facts = BindingRequestFacts {
             peer: peer_value("[::1]:50000"),
             change: Some(ChangeRequest::from_value(0x0000_0003)),
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
@@ -398,73 +452,72 @@ mod tests {
         let plan = decide(&facts, Some(default), &[default]);
         assert_eq!(
             plan.outcome,
-            Outcome::Error(ErrorCode::UnsupportedAddressFamily)
+            Outcome::Error(ErrorCode::UnknownAttribute)
         );
-        assert_eq!(plan.outcome.error().unwrap().number(), 437);
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
         assert!(!plan.include_xor_mapped);
     }
 
     #[test]
-    fn change_ip_from_an_ipv4_peer_answers_unsupported_family() {
-        // `A` alone means "another IPv6 address in the same scope", and IPv4
-        // has no scopes: 437, not the 386 that CHANGE-ADDRESS carries.
+    fn change_ip_from_an_ipv4_peer_answers_420() {
+        // `A` has no address-family restriction, but the host has no second
+        // address to answer from, so there is no alternate address and port.
         let default = listen_id(3478);
         let facts = BindingRequestFacts {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0x0000_0001)),
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
         };
         let plan = decide(&facts, Some(default), &[default]);
-        assert_eq!(
-            plan.outcome,
-            Outcome::Error(ErrorCode::UnsupportedAddressFamily)
-        );
-        assert_eq!(plan.outcome.error().unwrap().number(), 437);
+        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
     }
 
     #[test]
-    fn a_combined_change_from_an_ipv4_peer_answers_change_address() {
-        // The IPv4 form of the combined bit is what CHANGE-ADDRESS meant.
+    fn a_combined_change_from_an_ipv4_peer_answers_420() {
+        // The same request answers 420 over either family: RFC 5780 Section 6.1
+        // defines one error for every unsatisfiable CHANGE-REQUEST.
         let default = listen_id(3478);
         let facts = BindingRequestFacts {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0x0000_0003)),
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
         };
         let plan = decide(&facts, Some(default), &[default]);
-        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::ChangeAddress));
-        assert_eq!(plan.outcome.error().unwrap().number(), 386);
+        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
         assert_eq!(
             plan.outcome.error().unwrap().reason(),
-            ReasonPhrase::ChangeAddress
+            ReasonPhrase::UnknownAttribute
         );
     }
 
     #[test]
-    fn change_port_from_an_ipv6_peer_answers_unsupported_family() {
-        // `B` alone is satisfiable by a second listener, and there is none here:
-        // nothing the server can offer is not the default, so 437.
+    fn change_port_from_an_ipv6_peer_answers_420() {
+        // `B` alone needs a second listener, and there is none here: nothing
+        // the server can offer is not the default.
         let default =
             ServerIdentity::ipv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 1], 3478);
         let facts = BindingRequestFacts {
             peer: peer_value("[::1]:50000"),
             change: Some(ChangeRequest::from_value(0x0000_0002)),
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
         };
         let plan = decide(&facts, Some(default), &[default]);
-        assert_eq!(
-            plan.outcome,
-            Outcome::Error(ErrorCode::UnsupportedAddressFamily)
-        );
+        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
     }
 
     #[test]
@@ -475,6 +528,7 @@ mod tests {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0x0000_0003)),
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: true,
             unknown_attributes: None,
             redirect_to: Some(alternate),
@@ -494,6 +548,7 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: Some(alternate),
@@ -509,15 +564,14 @@ mod tests {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0x0000_0003)),
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
         };
         let plan = decide(&facts, None, &[]);
-        assert_eq!(
-            plan.outcome,
-            Outcome::Error(ErrorCode::UnsupportedAddressFamily)
-        );
+        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
     }
 
     #[test]
@@ -526,6 +580,7 @@ mod tests {
             peer: peer_value(PEER),
             change: None,
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
@@ -540,12 +595,13 @@ mod tests {
         let default = listen_id(3478);
         let ice = ice_value(IceRole::Conflict, Some(tie(1)));
 
-        // 1. The legacy CHANGE-ADDRESS code is unknown: 388.
+        // 1. The legacy CHANGE-ADDRESS code is unknown: 420.
         let unknown = [0x0005u16];
         let facts = BindingRequestFacts {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0x0000_0001)),
             ice: ice,
+            other_address: None,
             software_requested: false,
             unknown_attributes: Some(&unknown),
             redirect_to: None,
@@ -560,6 +616,7 @@ mod tests {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0x0000_0001)),
             ice: ice,
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
@@ -569,20 +626,85 @@ mod tests {
             Outcome::Error(ErrorCode::RoleConflict)
         );
 
-        // 3. With the role valid, CHANGE-REQUEST is what fails. `A` alone from
-        // an IPv4 peer is IPv6-only, so 437.
+        // 3. With the role valid, CHANGE-REQUEST is what fails: no second
+        // address exists, so 420.
         let facts = BindingRequestFacts {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0x0000_0001)),
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
         };
         assert_eq!(
             decide(&facts, Some(default), &[default]).outcome,
-            Outcome::Error(ErrorCode::UnsupportedAddressFamily)
+            Outcome::Error(ErrorCode::UnknownAttribute)
         );
+    }
+
+    #[test]
+    fn an_other_address_of_the_wrong_family_is_a_400() {
+        // The peer arrived on an IPv4 socket but named an IPv6 address: the
+        // request does not describe the connection it is on. This is 400, not
+        // the 420 the unknown-attribute arm answers, because OTHER-ADDRESS is
+        // an attribute the server does comprehend.
+        let default = listen_id(3478);
+        let facts = BindingRequestFacts {
+            peer: peer_value(PEER),
+            change: None,
+            ice: IceAttributes::default(),
+            other_address: Some(other_value(IpFamily::V6, [0xff; 16], 50000)
+                .expect("family code 0x02 is valid")),
+            software_requested: false,
+            unknown_attributes: None,
+            redirect_to: None,
+        };
+        let plan = decide(&facts, Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::BadRequest));
+        assert_eq!(plan.outcome.error().unwrap().number(), 400);
+        assert!(plan.unknown_attributes.is_none(), "a 400 carries no attribute list");
+    }
+
+    #[test]
+    fn an_other_address_that_names_the_connection_is_not_an_error() {
+        // The same family as the socket the request arrived on is fine: the
+        // check is on the family, not on whether the peer echoed the value it
+        // was told about.
+        let default = listen_id(3478);
+        let facts = BindingRequestFacts {
+            peer: peer_value(PEER),
+            change: None,
+            ice: IceAttributes::default(),
+            other_address: Some(other_value(IpFamily::V4,
+                [10, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 50000)
+                .expect("family code 0x01 is valid")),
+            software_requested: false,
+            unknown_attributes: None,
+            redirect_to: None,
+        };
+        let plan = decide(&facts, Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Success);
+    }
+
+    #[test]
+    fn comprehension_beats_the_other_address_family_check() {
+        // Step order is observable: a request that is both unknown and
+        // malformed answers 420, because the comprehension check runs first.
+        let default = listen_id(3478);
+        let unknown = [0x0006u16];
+        let facts = BindingRequestFacts {
+            peer: peer_value(PEER),
+            change: None,
+            ice: IceAttributes::default(),
+            other_address: Some(other_value(IpFamily::V6, [0xff; 16], 50000).unwrap()),
+            software_requested: false,
+            unknown_attributes: Some(&unknown),
+            redirect_to: None,
+        };
+        let plan = decide(&facts, Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
     }
 
     #[test]
@@ -592,6 +714,7 @@ mod tests {
             peer: peer_value(PEER),
             change: Some(ChangeRequest::from_value(0)),
             ice: IceAttributes::default(),
+            other_address: None,
             software_requested: false,
             unknown_attributes: None,
             redirect_to: None,
@@ -606,9 +729,31 @@ mod tests {
     fn the_change_action_to_plan_bridge_preserves_the_error() {
         let default = listen_id(3478);
         let plan = BindingResponsePlan::success(ChangeSource::Default)
-            .with_change_action(ChangeResponseAction::ChangeAddressOnly, default);
-        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::ChangeAddress));
+            .with_change_action(ChangeResponseAction::Unsatisfiable, default);
+        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
         assert!(!plan.include_xor_mapped);
+    }
+
+    #[test]
+    fn an_unhonorably_requested_change_names_the_attribute() {
+        // RFC 8489 Section 14.8 requires a 420 to carry the unknown code in an
+        // UNKNOWN-ATTRIBUTES attribute. The decision names the code point; the
+        // reply renders it.
+        let default = listen_id(3478);
+        let unknown = [0x0003u16];
+        let facts = BindingRequestFacts {
+            peer: peer_value(PEER),
+            change: Some(ChangeRequest::from_value(0x0000_0003)),
+            ice: IceAttributes::default(),
+            other_address: None,
+            software_requested: false,
+            unknown_attributes: Some(&unknown),
+            redirect_to: None,
+        };
+        let plan = decide(&facts, Some(default), &[default]);
+        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
     }
 
     #[test]
@@ -622,16 +767,29 @@ mod tests {
         );
     }
 
+    /// Build an `OTHER-ADDRESS` value in the on-wire layout: a zero octet,
+    /// the family code, the port, then the address.
+    fn other_value(family: IpFamily, address: [u8; 16], port: u16) -> Option<OtherAddress> {
+        let octets = match family {
+            IpFamily::V4 => 4,
+            IpFamily::V6 => 16,
+        };
+        let mut value = vec![0u8; 4 + octets];
+        value[1] = family.code();
+        value[2..4].copy_from_slice(&port.to_be_bytes());
+        value[4..4 + octets].copy_from_slice(&address[..octets]);
+        other_address_from_value(&value)
+    }
+
     #[test]
     fn an_other_address_family_mismatch_is_bad_request() {
         // An IPv6 connection cannot carry an IPv4 OTHER-ADDRESS: the request
-        // does not describe the connection it is on, so 400, not 437. The
+        // does not describe the connection it is on, so 400. The
         // attribute is optional, so the check lives beside the role check
         // rather than in the facts.
-        let mut other_bytes = [0u8; 16];
-        other_bytes[4..8].copy_from_slice(&[10, 0, 0, 7]);
-        other_bytes[8] = 0x01;
-        let other = other_address_from_bytes(other_bytes).unwrap();
+        let other = other_value(IpFamily::V4, [10, 0, 0, 7, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0], 50000)
+            .unwrap();
         assert_eq!(
             validate_other_address(&other, IpFamily::V6),
             IceValidation::WrongFamily

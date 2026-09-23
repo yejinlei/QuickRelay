@@ -21,10 +21,10 @@
 //!   with it, so 400 Bad Request.
 //! * Neither present, or exactly one with a tiebreaker -- acceptable.
 //! * `ICE-PRIORITY` present -- it belongs on a candidate-check, not on a
-//!   `Binding` request: 388 Unknown Attribute.
+//!   `Binding` request: 420 Unknown Attribute.
 //! * `OTHER-ADDRESS` naming a family different from the one this connection
 //!   actually uses -- the request does not describe the connection it is on:
-//!   400 Bad Request, checked by [`validate_other_address`].
+//!   400 Bad Request, reported as [`IceValidation::WrongFamily`].
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -33,7 +33,7 @@ use crate::ErrorCode;
 /// The address family of a socket address, as the server sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpFamily {
-    /// IPv4 (RFC 8445 Section 4.1.1.1, family `0x01`).
+    /// IPv4 (RFC 8489 Section 14.1, family `0x01`).
     V4,
     /// IPv6 (family `0x02`).
     V6,
@@ -119,59 +119,69 @@ impl IceAttributes {
     }
 }
 
-/// The `OTHER-ADDRESS` value: the peer's address as it knows it.
+/// The `OTHER-ADDRESS` value, in the layout its defining RFCs give it.
+///
+/// RFC 5780 Section 7.4 makes OTHER-ADDRESS a rename of RFC 3489's
+/// CHANGED-ADDRESS that keeps the same attribute number, and RFC 3489
+/// Section 11.2.3 calls that attribute's syntax "identical to MAPPED-ADDRESS".
+/// So the value is the MAPPED-ADDRESS body: a zero octet, the family code,
+/// the port, then the address -- 8 octets for IPv4 and 20 for IPv6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OtherAddress {
-    /// The family of `address`.
+    /// The family of `address` and `port`.
     pub family: IpFamily,
-    /// The address octets, 16 wide and zero-padded for IPv4.
+    /// The port the attribute carries.
+    pub port: u16,
+    /// The address octets, zero-padded to 16 so an IPv4 value needs no
+    /// special case. An IPv4 address sits in the first four octets.
     pub address: [u8; 16],
 }
 
-/// Read `OTHER-ADDRESS` from its 16-octet attribute body: the 8-octet address,
-/// then a family code, then 7 reserved octets. Returns `None` when the family
-/// code is not `0x01` or `0x02`.
-///
-/// Kept a free function rather than a field of [`IceAttributes`] so that
-/// `quickrelay-server` can decide, per message, whether to pass the value
-/// through; the attribute is optional.
-pub fn other_address_from_bytes(bytes: [u8; 16]) -> Option<OtherAddress> {
-    let family = match bytes[8] {
-        0x01 => IpFamily::V4,
-        0x02 => IpFamily::V6,
+/// Decode an `OTHER-ADDRESS` value. Returns `None` when the leading octet is
+/// not zero, the family code is not `0x01` or `0x02`, or the value's length
+/// does not match its family -- 8 octets for IPv4, 20 for IPv6.
+pub fn other_address_from_value(value: &[u8]) -> Option<OtherAddress> {
+    if value.is_empty() || value[0] != 0 {
+        return None;
+    }
+    let (family, octets) = match value.get(1) {
+        Some(0x01) => (IpFamily::V4, 4),
+        Some(0x02) => (IpFamily::V6, 16),
         _ => return None,
     };
-    let mut address = [0u8; 16];
-    address[..8].copy_from_slice(&bytes[..8]);
-    // The IPv4 form places the address in the low 32 bits of the
-    // 64-bit field, so it lands in the low 32 bits of the 16-octet
-    // carrier as well. `other_address_to_ip_addr` reads it back from there.
-    if family == IpFamily::V4 {
-        address[12..].copy_from_slice(&bytes[4..8]);
+    if value.len() != 4 + octets {
+        return None;
     }
-    Some(OtherAddress { family, address })
+    let mut address = [0u8; 16];
+    address[..octets].copy_from_slice(&value[4..4 + octets]);
+    Some(OtherAddress {
+        family,
+        port: u16::from_be_bytes([value[2], value[3]]),
+        address,
+    })
 }
 
-/// Put an `OTHER-ADDRESS` value back into its 16-octet carrier.
-pub fn other_address_to_bytes(other: OtherAddress) -> [u8; 16] {
-    let mut bytes = [0u8; 16];
-    if other.family == IpFamily::V4 {
-        bytes[4..8].copy_from_slice(&other.address[12..16]);
-    } else {
-        bytes[..8].copy_from_slice(&other.address[..8]);
-    }
-    bytes[8] = other.family.code();
-    bytes
+/// Encode `other` back into its value: 8 octets for IPv4, 20 for IPv6.
+pub fn other_address_to_value(other: &OtherAddress) -> Vec<u8> {
+    let octets = match other.family {
+        IpFamily::V4 => 4,
+        IpFamily::V6 => 16,
+    };
+    let mut out = vec![0u8; 4 + octets];
+    out[1] = other.family.code();
+    out[2..4].copy_from_slice(&other.port.to_be_bytes());
+    out[4..4 + octets].copy_from_slice(&other.address[..octets]);
+    out
 }
 
 /// The address in `other` as an [`IpAddr`], respecting its family.
-pub fn other_address_to_ip_addr(other: OtherAddress) -> Option<IpAddr> {
+pub fn other_address_to_ip_addr(other: &OtherAddress) -> Option<IpAddr> {
     match other.family {
-        IpFamily::V4 => Some(IpAddr::from(Ipv4Addr::from([
-            other.address[12],
-            other.address[13],
-            other.address[14],
-            other.address[15],
+        IpFamily::V4 => Some(IpAddr::V4(Ipv4Addr::from([
+            other.address[0],
+            other.address[1],
+            other.address[2],
+            other.address[3],
         ]))),
         IpFamily::V6 => Some(IpAddr::V6(Ipv6Addr::from(other.address))),
     }
@@ -189,7 +199,7 @@ pub enum IceValidation {
     Conflict,
     /// `OTHER-ADDRESS` names a family different from the one this connection
     /// actually uses: the request does not describe the connection it is on, so
-    /// it is not well formed. See [`validate_other_address`].
+    /// it is not well formed.
     WrongFamily,
     /// A role attribute is present without a tiebreaker.
     Malformed,
@@ -229,7 +239,8 @@ pub fn role_conflict(
     if matches!(peer_role, IceRole::Conflict) {
         return IceValidation::Conflict;
     }
-    if matches!(peer_role, IceRole::Controlled | IceRole::Controlling) && peer_tiebreaker.is_none()
+    if matches!(peer_role, IceRole::Controlled | IceRole::Controlling)
+        && peer_tiebreaker.is_none()
     {
         return IceValidation::Malformed;
     }
@@ -260,8 +271,9 @@ pub fn role_conflict(
 ///
 /// Checks role conflict (487) and role/tiebreaker well-formedness (400).
 /// `peer_family` is the family of the connection the request arrived on, read
-/// from the socket; it is not used by the role check itself, it is carried so
-/// the caller can run [`validate_other_address`] against the same value.
+/// from the socket: it is the input the caller also feeds to the
+/// `OTHER-ADDRESS` family check, so one call takes everything a connection can
+/// supply.
 pub fn validate(attributes: &IceAttributes, _peer_family: IpFamily) -> IceValidation {
     role_conflict(attributes.role, attributes.tiebreaker, None, None)
 }
@@ -272,8 +284,8 @@ pub fn validate(attributes: &IceAttributes, _peer_family: IpFamily) -> IceValida
 /// `OTHER-ADDRESS` names the peer's own local address, so a peer that names a
 /// family different from the one this connection actually uses is not who it
 /// says it is: [`IceValidation::WrongFamily`], which maps to 400 Bad Request.
-/// Kept separate from [`validate`] because the attribute is optional and the
-/// caller extracts it per message.
+/// Kept out of [`validate`] because the attribute is optional and the caller
+/// extracts it per message.
 pub fn validate_other_address(other: &OtherAddress, peer_family: IpFamily) -> IceValidation {
     if other.family.differs_from(peer_family) {
         return IceValidation::WrongFamily;
@@ -349,15 +361,18 @@ mod tests {
     fn other_address_must_match_the_peer_family() {
         let other = OtherAddress {
             family: IpFamily::V4,
-            address: {
-                let mut a = [0u8; 16];
-                a[12..].copy_from_slice(&[10, 0, 0, 7]);
-                a
-            },
+            port: 50000,
+            address: [10, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         };
         assert_eq!(
-            other_address_to_ip_addr(other).unwrap().to_string(),
+            other_address_to_ip_addr(&other).unwrap().to_string(),
             "10.0.0.7"
+        );
+        // Decode -> encode is the identity, in both families.
+        let ipv4 = [0x00u8, 0x01, 0xC3, 0x50, 10, 0, 0, 7];
+        assert_eq!(
+            other_address_to_value(&other_address_from_value(&ipv4).unwrap()),
+            &ipv4[..]
         );
         assert!(!other.family.differs_from(IpFamily::V4));
 
@@ -378,16 +393,28 @@ mod tests {
     }
 
     #[test]
-    fn other_address_rejects_an_unknown_family_code() {
-        let mut bytes = [0u8; 16];
-        bytes[4..8].copy_from_slice(&[10, 0, 0, 7]);
-        bytes[8] = 0x03;
-        assert!(other_address_from_bytes(bytes).is_none());
+    fn other_address_rejects_a_value_its_family_does_not_fit() {
+        // A value is 8 octets for IPv4 and 20 for IPv6; the family code
+        // decides which, and anything else is neither.
+        let ipv6: [u8; 20] = [
+            0x00, 0x02, 0xC3, 0x50, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ];
+        assert_eq!(
+            other_address_to_value(&other_address_from_value(&ipv6).unwrap()),
+            &ipv6[..]
+        );
+        assert_eq!(
+            other_address_from_value(&ipv6).unwrap().family,
+            IpFamily::V6
+        );
 
-        bytes[8] = 0x01;
-        let other = other_address_from_bytes(bytes).unwrap();
-        assert_eq!(other.family, IpFamily::V4);
-        assert_eq!(other_address_to_bytes(other), bytes);
+        // Family code 0x03 is not a family.
+        assert!(other_address_from_value(&[0x00, 0x03, 0, 0, 0, 0, 0, 0]).is_none());
+        // The leading octet must be zero.
+        assert!(other_address_from_value(&[0x01, 0x01, 0, 0, 0, 0, 0, 0]).is_none());
+        // An IPv6 family code with an IPv4-length value.
+        assert!(other_address_from_value(&[0x00, 0x02, 0, 0, 0, 0, 0, 0]).is_none());
     }
 
     #[test]
@@ -459,12 +486,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_attributes_map_to_388() {
+    fn unknown_attributes_map_to_420() {
         assert_eq!(
             IceValidation::UnknownAttribute.error(),
             Some(ErrorCode::UnknownAttribute)
         );
-        assert_eq!(ErrorCode::UnknownAttribute.number(), 388);
+        assert_eq!(ErrorCode::UnknownAttribute.number(), 420);
     }
 
     #[test]

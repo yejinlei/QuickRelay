@@ -13,7 +13,7 @@
 //! wire the way they would between a WebRTC endpoint and a TURN server.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 
 use quickrelay_binding as binding;
 
@@ -127,6 +127,7 @@ fn the_same_request_over_ice_tcp_gets_the_same_answer_as_over_udp() {
     let facts = |from: SocketAddr| binding::BindingRequestFacts {
         peer: from,
         change: None,
+        other_address: None,
         ice: binding::IceAttributes::default(),
         software_requested: true,
         unknown_attributes: None,
@@ -149,6 +150,7 @@ fn a_role_conflict_over_ice_tcp_is_487_like_over_udp() {
     let facts = binding::BindingRequestFacts {
         peer: "10.0.0.7:50000".parse().unwrap(),
         change: None,
+        other_address: None,
         ice: binding::IceAttributes {
             role: binding::IceRole::Conflict,
             tiebreaker: Some(binding::IceTiebreaker(1)),
@@ -173,10 +175,11 @@ fn a_role_conflict_over_ice_tcp_is_487_like_over_udp() {
 fn other_address_is_checked_against_the_family_of_the_transport() {
     // OTHER-ADDRESS names the peer's own local address, so the family has to
     // match the connection the request arrived on, whatever it is.
-    let mut bytes = [0u8; 16];
-    bytes[4..8].copy_from_slice(&[10, 0, 0, 7]);
-    bytes[8] = 0x01;
-    let other = binding::ice::other_address_from_bytes(bytes).unwrap();
+    // OTHER-ADDRESS carries the MAPPED-ADDRESS layout (RFC 5780 Section 7.4,
+    // RFC 3489 Section 11.2.3): a zero octet, the family code, the port,
+    // then the address.
+    let other = binding::ice::other_address_from_value(&[0x00, 0x01, 0xC3, 0x50, 10, 0, 0, 7])
+        .unwrap();
     assert_eq!(
         binding::ice::validate_other_address(&other, binding::IpFamily::V4),
         binding::IceValidation::Ok
@@ -186,6 +189,27 @@ fn other_address_is_checked_against_the_family_of_the_transport() {
         binding::IceValidation::WrongFamily
     );
     assert!(
-        binding::ice::other_address_to_ip_addr(other).unwrap().is_ipv4()
+        binding::ice::other_address_to_ip_addr(&other).unwrap().is_ipv4()
     );
+
+    // The same value through the decision table: an IPv4 OTHER-ADDRESS on an
+    // IPv6 connection is a 400, and a 400 carries no attribute list.
+    let peer: SocketAddr = (IpAddr::V6(Ipv6Addr::LOCALHOST), 50000).into();
+    let source = binding::ServerIdentity::ipv6(Ipv6Addr::LOCALHOST.octets(), 3478);
+    let facts = binding::BindingRequestFacts {
+        peer,
+        change: None,
+        other_address: Some(other),
+        ice: binding::IceAttributes::default(),
+        software_requested: false,
+        unknown_attributes: None,
+        redirect_to: None,
+    };
+    let plan = binding::decide(&facts, Some(source), &[source]);
+    assert_eq!(
+        plan.outcome,
+        binding::response::Outcome::Error(binding::ErrorCode::BadRequest)
+    );
+    assert_eq!(plan.outcome.error().unwrap().number(), 400);
+    assert!(plan.unknown_attributes.is_none());
 }

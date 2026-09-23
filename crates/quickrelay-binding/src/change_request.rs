@@ -11,19 +11,28 @@
 //!
 //! # What the table says
 //!
-//! RFC 5780 Section 6.1 constrains a flag by the other dimension being held
-//! constant across two listening addresses, and by address family:
+//! RFC 5780 Section 6.1 constrains a flag only by the other dimension being
+//! held constant across two listening addresses. The flag table (Table 1)
+//! carries no address-family restriction on any row:
 //!
-//! | flags    | peer family | requirement              | error row if unmet            |
-//! | -------- | ----------- | ------------------------ | ----------------------------- |
-//! | `A`      | IPv6 only   | same port, other address | 437 Unsupported Address Family |
-//! | `B`      | either      | same address, other port | 437 Unsupported Address Family |
-//! | `A`|`B`  | IPv6        | both differ              | 437 Unsupported Address Family |
-//! | `A`|`B`  | IPv4        | both differ              | 386 Change-Address Unassigned  |
+//! | flags    | requirement              | error if unmet                 |
+//! | -------- | ------------------------ | ------------------------------ |
+//! | `A`      | same port, other address | 420 Unknown Attribute          |
+//! | `B`      | same address, other port | 420 Unknown Attribute          |
+//! | `A`|`B`  | both differ              | 420 Unknown Attribute          |
 //!
-//! `A` alone is IPv6-only because the flag means "another local unicast address
-//! in the same scope", and IPv4 has no scopes. The IPv4 form of the combined bit
-//! is what the legacy `CHANGE-ADDRESS` meant, which is why only that row is 386.
+//! RFC 5780 Section 6.1 does not define per-flag error codes: "If the Request
+//! contains the CHANGE-REQUEST attribute and the server does not have an
+//! alternate address and port as described above, the server MUST generate an
+//! error response of type 420."
+//!
+//! Two consequences, both enforced in this module:
+//!
+//! * `A` alone is **not** IPv6-only. Nothing in RFC 5780 says so, and an IPv4
+//!   host with two local addresses satisfies `A` exactly as an IPv6 one does.
+//! * There is no 386 and no 437 to choose between. 386 is not a STUN error
+//!   code at all, and 437 is TURN's `Allocation Mismatch` (RFC 8656 Section
+//!   19), not a STUN code. Every unsatisfiable row emits 420.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -64,23 +73,23 @@ impl ChangeRequest {
         !self.is_empty()
     }
 
-    /// Whether the flag set is even meaningful for `family` (RFC 5780
-    /// Section 6.1 Table 1). `A` alone is IPv6-only: the flag means "another
-    /// IPv6 address in the same scope", and IPv4 has no scopes. `B` and the
-    /// combined bit have no family restriction.
-    pub const fn is_actionable_for(self, family: IpFamily) -> bool {
-        match (self.change_ip, self.change_port) {
-            (false, false) => false,
-            (true, false) => matches!(family, IpFamily::V6),
-            _ => true,
-        }
+    /// Whether the flag set asks for anything at all.
+    ///
+    /// RFC 5780 Section 6.1 puts no address-family restriction on any flag:
+    /// `A` means "answer from the other IP address" and `B` means "answer on
+    /// the other port", whichever family the host listens on. The parameter
+    /// is kept so callers keep the shape of the check, but it does not filter
+    /// anything.
+    pub const fn is_actionable_for(self, _family: IpFamily) -> bool {
+        !self.is_empty()
     }
 
     /// Resolve against the server's listening addresses.
     ///
-    /// `peer` is the source address the request was read from — its family
-    /// selects the row of RFC 5780 Table 1. `default` is the identity the
-    /// reply would otherwise leave from, which a candidate must differ from:
+    /// `peer` is the source address the request was read from, kept for the
+    /// family of the connection the request arrived on. `default` is the
+    /// identity the reply would otherwise leave from, which a candidate must
+    /// differ from:
     /// the flag is relative to where the request arrived, not to where the
     /// peer sits. It is included in `addresses` by convention, so a candidate
     /// equal to it is never reported as a change. `addresses` is the full
@@ -119,22 +128,18 @@ impl ChangeRequest {
 
     /// The single candidate check, shared by the flag rows.
     ///
-    /// `peer` selects the row of RFC 5780 Table 1 by its family. `default` is
+    /// `peer` is the source the request came from; it carries no row of its
+    /// own, because RFC 5780 Table 1 is keyed by the flag bits only. `default`
+    /// is
     /// what a candidate must differ from: `CHANGE-REQUEST` is relative to
     /// where the request arrived, not to where the peer sits, so the peer
     /// address never enters the comparison itself.
     fn find_source(
         &self,
-        peer: SocketAddr,
+        _peer: SocketAddr,
         default: ServerIdentity,
         addresses: &[ServerIdentity],
     ) -> Option<ServerIdentity> {
-        // `A` without `B` is the IPv6-only row of the table: the flag means
-        // "another address in the same scope", and IPv4 has no scopes, so no
-        // IPv4 listen address can ever satisfy it.
-        if self.change_ip && !self.change_port && family_of(peer) != IpFamily::V6 {
-            return None;
-        }
         addresses.iter().copied().find(|id| {
             // The default socket is never a change: the request arrived at
             // it, so answering from it answers from the same place.
@@ -156,19 +161,14 @@ impl ChangeRequest {
         })
     }
 
-    /// The error row of the table, chosen by which flag the peer asked for.
+    /// The error row for any flag set the listen list cannot honor.
     ///
-    /// RFC 5780 Section 6.1 assigns `Change-Address Unassigned` (386) only to
-    /// `CHANGE-ADDRESS`, which is the IPv4 form of the combined bit. Every
-    /// other flag that cannot be honored is `Unsupported Address Family`
-    /// (437), including `A` alone against an IPv4 peer, where the IPv6 scope
-    /// the flag refers to does not exist.
-    fn unsatisfiable(self, family: IpFamily) -> ChangeResponseAction {
-        match (self.change_ip, self.change_port) {
-            // `CHANGE-ADDRESS` = `A`|`B` over IPv4.
-            (true, true) if family == IpFamily::V4 => ChangeResponseAction::ChangeAddressOnly,
-            _ => ChangeResponseAction::UnsupportedFamily,
-        }
+    /// RFC 5780 Section 6.1 defines a single error for an unsatisfiable
+    /// `CHANGE-REQUEST`: "the server MUST generate an error response of type
+    /// 420". There is no per-flag split, so the family of the peer does not
+    /// matter either — the answer is the same whichever row failed.
+    fn unsatisfiable(self, _family: IpFamily) -> ChangeResponseAction {
+        ChangeResponseAction::Unsatisfiable
     }
 }
 
@@ -202,22 +202,9 @@ pub enum ChangeResponseAction {
     ChangePortOnly(ServerIdentity),
     /// Answer from a different address on a different port.
     ChangeBoth(ServerIdentity),
-    /// No address is available to satisfy the request: emit an error reply
-    /// (see `crate::error_codes::ErrorCode::UnsupportedAddressFamily`).
-    ///
-    /// Reserved for the `CHANGE-IP`|`CHANGE-PORT` row that cannot be met: the
-    /// reply must differ in *both* dimensions at once and no listen address
-    /// differs in both. The pure-flag rows use [`ChangeAddressOnly`] and
-    /// [`UnsupportedFamily`] below so the peer can tell them apart.
+    /// No listen address can satisfy the flag set: emit 420 Unknown Attribute,
+    /// the single error RFC 5780 Section 6.1 defines for this case.
     Unsatisfiable,
-    /// The IPv4 combined-bit row could not be met: this is
-    /// `CHANGE-ADDRESS`, whose error is `Change-Address Unassigned` (386)
-    /// rather than 437.
-    ChangeAddressOnly,
-    /// Any other flag the server could not honor, including `A` alone from an
-    /// IPv4 peer, where the IPv6 scope the flag refers to does not exist.
-    /// RFC 5780 Section 6.1's `Unsupported Address Family` (437).
-    UnsupportedFamily,
 }
 
 impl ChangeResponseAction {
@@ -230,20 +217,16 @@ impl ChangeResponseAction {
             ChangeResponseAction::ChangeIpOnly(id)
             | ChangeResponseAction::ChangePortOnly(id)
             | ChangeResponseAction::ChangeBoth(id) => Some(id),
-            ChangeResponseAction::Unsatisfiable
-            | ChangeResponseAction::ChangeAddressOnly
-            | ChangeResponseAction::UnsupportedFamily => None,
+            ChangeResponseAction::Unsatisfiable => None,
         }
     }
 
-    /// Which error code, if any, this action maps to.
+    /// Which error code, if any, this action maps to. RFC 5780 Section 6.1
+    /// names one code for every unsatisfiable `CHANGE-REQUEST`: 420.
     pub fn error(self) -> Option<crate::ErrorCode> {
         use crate::ErrorCode;
         match self {
-            ChangeResponseAction::ChangeAddressOnly => Some(ErrorCode::ChangeAddress),
-            ChangeResponseAction::UnsupportedFamily | ChangeResponseAction::Unsatisfiable => {
-                Some(ErrorCode::UnsupportedAddressFamily)
-            }
+            ChangeResponseAction::Unsatisfiable => Some(ErrorCode::UnknownAttribute),
             _ => None,
         }
     }
@@ -257,9 +240,7 @@ impl ChangeResponseAction {
             | ChangeResponseAction::ChangeIpOnly(_)
             | ChangeResponseAction::ChangePortOnly(_)
             | ChangeResponseAction::ChangeBoth(_) => true,
-            ChangeResponseAction::Unsatisfiable
-            | ChangeResponseAction::ChangeAddressOnly
-            | ChangeResponseAction::UnsupportedFamily => false,
+            ChangeResponseAction::Unsatisfiable => false,
         }
     }
 }
@@ -360,15 +341,15 @@ mod tests {
         let action = change_both().resolve(peer, Some(default), &[other, default]);
         assert_eq!(action, ChangeResponseAction::ChangeBoth(other));
 
-        // Nothing but the default is listening: the combined row over IPv4 is
-        // `CHANGE-ADDRESS`, so 386 rather than 437.
+        // Nothing but the default is listening, so there is no alternate
+        // address and port at all: RFC 5780 Section 6.1's single 420.
         let action = change_both().resolve(peer, Some(default), &[default]);
-        assert_eq!(action, ChangeResponseAction::ChangeAddressOnly);
-        assert_eq!(action.error(), Some(crate::ErrorCode::ChangeAddress));
+        assert_eq!(action, ChangeResponseAction::Unsatisfiable);
+        assert_eq!(action.error(), Some(crate::ErrorCode::UnknownAttribute));
     }
 
     #[test]
-    fn change_ip_only_is_actionable_only_for_ipv6() {
+    fn change_ip_only_answers_from_the_other_address_on_an_ipv6_host() {
         let peer6: SocketAddr = "[::1]:50000".parse().unwrap();
         let first = id6([0; 16], 3478);
         let second = id6(LOOPBACK6, 3478);
@@ -378,34 +359,36 @@ mod tests {
             ChangeRequest::from_value(0x0000_0001).resolve(peer6, Some(first), &[first, second]);
         assert_eq!(action, ChangeResponseAction::ChangeIpOnly(second));
 
-        // A different port on the same address is not `A`-only: the row still
-        // cannot be met, so it is 437.
+        // A different port on the same address is not `A`-only, so the request
+        // is unsatisfiable and gets 420.
         let wrong_port = id6(LOOPBACK6, 3479);
         let action = ChangeRequest::from_value(0x0000_0001).resolve(
             peer6,
             Some(first),
             &[first, wrong_port],
         );
-        assert_eq!(action, ChangeResponseAction::UnsupportedFamily);
+        assert_eq!(action, ChangeResponseAction::Unsatisfiable);
+        assert_eq!(action.error(), Some(crate::ErrorCode::UnknownAttribute));
     }
 
     #[test]
-    fn change_ip_only_from_an_ipv4_peer_is_unsupported_family() {
-        // RFC 5780 Section 6.1: `A` alone means "another IPv6 address in the
-        // same scope". IPv4 has no scopes, so no IPv4 listen address can
-        // ever satisfy it and the error is 437, not the 386 that
-        // `CHANGE-ADDRESS` carries.
+    fn change_ip_only_works_for_an_ipv4_host_too() {
+        // `A` has no address-family restriction in RFC 5780: an IPv4 host with
+        // two local addresses answers from the other one exactly as an IPv6
+        // host does.
         let peer: SocketAddr = "10.0.0.7:50000".parse().unwrap();
         let default = id4(10, 0, 0, 1, 3478);
         let other = id4(10, 0, 0, 2, 3478);
 
         let action =
             ChangeRequest::from_value(0x0000_0001).resolve(peer, Some(default), &[default, other]);
-        assert_eq!(action, ChangeResponseAction::UnsupportedFamily);
-        assert_eq!(
-            action.error(),
-            Some(crate::ErrorCode::UnsupportedAddressFamily)
-        );
+        assert_eq!(action, ChangeResponseAction::ChangeIpOnly(other));
+        assert_eq!(action.source(), Some(other));
+
+        // With no second address there is nothing to change to: 420.
+        let action = ChangeRequest::from_value(0x0000_0001).resolve(peer, Some(default), &[default]);
+        assert_eq!(action, ChangeResponseAction::Unsatisfiable);
+        assert_eq!(action.error(), Some(crate::ErrorCode::UnknownAttribute));
         assert!(!action.maps_address());
     }
 
@@ -420,14 +403,16 @@ mod tests {
             ChangeRequest::from_value(0x0000_0002).resolve(peer, Some(default), &[default, other]);
         assert_eq!(action, ChangeResponseAction::ChangePortOnly(other));
 
-        // A different address on the same port is not `B`-only.
+        // A different address on the same port is not `B`-only, so it is
+        // unsatisfiable and gets 420.
         let wrong_addr = id4(10, 0, 0, 2, 3478);
         let action = ChangeRequest::from_value(0x0000_0002).resolve(
             peer,
             Some(default),
             &[default, wrong_addr],
         );
-        assert_eq!(action, ChangeResponseAction::UnsupportedFamily);
+        assert_eq!(action, ChangeResponseAction::Unsatisfiable);
+        assert_eq!(action.error(), Some(crate::ErrorCode::UnknownAttribute));
     }
 
     #[test]
@@ -442,40 +427,40 @@ mod tests {
             ChangeRequest::from_value(0x0000_0002).resolve(peer, Some(default), &[default, other]);
         assert_eq!(action, ChangeResponseAction::ChangePortOnly(other));
 
-        // A different address on the same port is not `B`-only.
+        // A different address on the same port is not `B`-only, so it is
+        // unsatisfiable and gets 420.
         let wrong_addr = id6(LOOPBACK6, 3478);
         let action = ChangeRequest::from_value(0x0000_0002).resolve(
             peer,
             Some(default),
             &[default, wrong_addr],
         );
-        assert_eq!(action, ChangeResponseAction::UnsupportedFamily);
+        assert_eq!(action, ChangeResponseAction::Unsatisfiable);
+        assert_eq!(action.error(), Some(crate::ErrorCode::UnknownAttribute));
     }
 
     #[test]
-    fn the_table_rows_are_selected_by_the_peer_family() {
-        assert_eq!(
-            ChangeRequest::from_value(0x0000_0001).is_actionable_for(IpFamily::V6),
-            true
-        );
-        assert_eq!(
-            ChangeRequest::from_value(0x0000_0001).is_actionable_for(IpFamily::V4),
-            false
-        );
-        assert_eq!(
-            ChangeRequest::from_value(0x0000_0002).is_actionable_for(IpFamily::V4),
-            true
-        );
-        assert_eq!(
-            ChangeRequest::from_value(0x0000_0002).is_actionable_for(IpFamily::V6),
-            true
-        );
-        assert_eq!(change_both().is_actionable_for(IpFamily::V4), true);
-        assert_eq!(change_both().is_actionable_for(IpFamily::V6), true);
-        assert_eq!(
-            ChangeRequest::default().is_actionable_for(IpFamily::V4),
-            false
-        );
+    fn no_flag_row_is_address_family_specific() {
+        // RFC 5780 Table 1 carries no family restriction, so every flag set
+        // asks for something on either family.
+        for family in [IpFamily::V4, IpFamily::V6] {
+            assert!(
+                ChangeRequest::from_value(0x0000_0001).is_actionable_for(family),
+                "`A` is actionable for {family:?}"
+            );
+            assert!(
+                ChangeRequest::from_value(0x0000_0002).is_actionable_for(family),
+                "`B` is actionable for {family:?}"
+            );
+            assert!(
+                change_both().is_actionable_for(family),
+                "`A`|`B` is actionable for {family:?}"
+            );
+            assert!(
+                !ChangeRequest::default().is_actionable_for(family),
+                "no flag set asks for nothing"
+            );
+        }
     }
 
     #[test]
@@ -484,13 +469,14 @@ mod tests {
         let only = id4(10, 0, 0, 1, 3478);
 
         let action = change_both().resolve(peer, Some(only), &[only]);
-        assert_eq!(action, ChangeResponseAction::ChangeAddressOnly);
+        assert_eq!(action, ChangeResponseAction::Unsatisfiable);
         assert_eq!(action.source(), None);
         assert!(!action.maps_address());
+        assert_eq!(action.error(), Some(crate::ErrorCode::UnknownAttribute));
 
         // An empty listen list is the same story, not a special case.
         let action = change_both().resolve(peer, None, &[]);
-        assert_eq!(action, ChangeResponseAction::ChangeAddressOnly);
+        assert_eq!(action, ChangeResponseAction::Unsatisfiable);
     }
 
     #[test]
@@ -502,20 +488,17 @@ mod tests {
         // to. It is still not a change: `CHANGE-REQUEST` is relative to where
         // the request arrived, not to the peer address.
         let action = change_both().resolve(peer, Some(default), &[default]);
-        assert_eq!(action, ChangeResponseAction::ChangeAddressOnly);
+        assert_eq!(action, ChangeResponseAction::Unsatisfiable);
         assert_eq!(action.source(), None);
         assert!(!action.maps_address());
 
-        // The same bits against an IPv6 peer are 437 instead: the combined
-        // row is only `CHANGE-ADDRESS` over IPv4.
+        // The same bits against an IPv6 peer are the same error: RFC 5780
+        // Section 6.1 defines one code for every unsatisfiable request.
         let peer6: SocketAddr = "[::1]:50000".parse().unwrap();
         let only6 = id6([0; 16], 3478);
         let action = change_both().resolve(peer6, Some(only6), &[only6]);
-        assert_eq!(action, ChangeResponseAction::UnsupportedFamily);
-        assert_eq!(
-            action.error(),
-            Some(crate::ErrorCode::UnsupportedAddressFamily)
-        );
+        assert_eq!(action, ChangeResponseAction::Unsatisfiable);
+        assert_eq!(action.error(), Some(crate::ErrorCode::UnknownAttribute));
     }
 
     #[test]

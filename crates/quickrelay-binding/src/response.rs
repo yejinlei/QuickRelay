@@ -170,6 +170,16 @@ pub struct BindingResponsePlan {
     pub include_alternate_server: bool,
     /// When to echo SOFTWARE (RFC 5389 Section 15.3).
     pub include_software: bool,
+    /// The attribute codes to report in `UNKNOWN-ATTRIBUTES` when the outcome
+    /// is `Error(UnknownAttribute)`, or `None` when the reply carries none.
+    ///
+    /// RFC 8489 Section 6.3.1 and Section 14.8 require a 420 to list the
+    /// unknown comprehension-required attributes it met; the code alone tells
+    /// a peer nothing about which attribute to drop. `decide` names the codes,
+    /// `quickrelay-server` renders them. The list is owned rather than a
+    /// borrow: the codes are read out of the request's scratch buffer, which
+    /// dies before the reply is cached and replayed.
+    pub unknown_attributes: Option<Vec<u16>>,
 }
 
 impl BindingResponsePlan {
@@ -181,6 +191,7 @@ impl BindingResponsePlan {
             source,
             include_alternate_server: false,
             include_software: false,
+            unknown_attributes: None,
         }
     }
 
@@ -193,6 +204,7 @@ impl BindingResponsePlan {
             source: ChangeSource::Default,
             include_alternate_server: false,
             include_software: false,
+            unknown_attributes: None,
         }
     }
 
@@ -209,6 +221,7 @@ impl BindingResponsePlan {
             source: ChangeSource::Explicit(source),
             include_alternate_server: true,
             include_software: false,
+            unknown_attributes: None,
         }
     }
 
@@ -228,6 +241,7 @@ impl BindingResponsePlan {
                     self.include_alternate_server = false;
                     self.include_software = false;
                     self.source = ChangeSource::Default;
+                    self.unknown_attributes = None;
                 }
             }
         }
@@ -244,6 +258,16 @@ impl BindingResponsePlan {
     /// let a rejected probe read as an answered one.
     pub fn with_software(mut self, include: bool) -> Self {
         self.include_software = include;
+        self
+    }
+
+    /// Carry the unknown attribute codes a 420 must report. RFC 8489
+    /// Section 6.3.1 requires the reply to list them, so the 420 that reaches
+    /// a peer says which attribute it rejected rather than only that one
+    /// exists. Never called on a non-420 plan: an attribute list on any other
+    /// code is noise the peer would have to discard.
+    pub fn with_unknown_attributes(mut self, codes: &[u16]) -> Self {
+        self.unknown_attributes = Some(codes.to_vec());
         self
     }
 
@@ -353,11 +377,9 @@ mod tests {
     fn an_unsatisfiable_change_action_turns_the_plan_into_an_error() {
         let default = default_identity();
         let plan = BindingResponsePlan::success(ChangeSource::Default)
-            .with_change_action(ChangeResponseAction::UnsupportedFamily, default);
-        assert_eq!(
-            plan.outcome,
-            Outcome::Error(ErrorCode::UnsupportedAddressFamily)
-        );
+            .with_change_action(ChangeResponseAction::Unsatisfiable, default);
+        assert_eq!(plan.outcome, Outcome::Error(ErrorCode::UnknownAttribute));
+        assert_eq!(plan.outcome.error().unwrap().number(), 420);
         assert!(!plan.include_xor_mapped);
         assert_eq!(plan.source, ChangeSource::Default);
     }

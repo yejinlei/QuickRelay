@@ -1,10 +1,16 @@
 //! Error-code decisions for STUN Binding responses.
 //!
-//! Every value here MUST be assigned in the IANA STUN registry
-//! (`stun-parameters`, updated 2024-12-20): `STUN Error Codes` and
-//! `Extension Codes` are registered in the same registry. 430, 390 and 370
-//! are Unassigned and must never be emitted; the legacy RFC 3489 codes are
-//! obsolete.
+//! Every value here has a row in the STUN error-code table, which RFC 5389
+//! Section 15.6 and RFC 8489 Section 14.8 reproduce (300, 400, 401, 420, 438,
+//! 500) and RFC 8445 Section 16.2 extends (487). Nothing in this file invents
+//! a number: every `number()` below is quoted from one of those tables.
+//!
+//! The three numbers a duplicate request used to be answered with are gone.
+//! 370, 390 and 430 appear in no STUN error-code table — 430 was RFC 3489's
+//! "Stale Credentials" and died with that document — so there is no variant
+//! for them, and no code to remove. A duplicate request is not an error at
+//! all: the server replays the datagram it already sent, which is the
+//! transaction cache in `quickrelay-server`.
 //!
 //! Protocol error-code decisions. Wire-level `ERROR-CODE` construction lives in
 //! `quickrelay-protocol`; the mapping between the two is `quickrelay-server`.
@@ -12,27 +18,24 @@
 /// Protocol error codes this crate can decide on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
-    /// Bad Request (RFC 5389 Section 12.1.1).
+    /// The client should contact an alternate server (RFC 8489 Section 14.8).
+    TryAlternate,
+    /// The request was malformed (RFC 8489 Section 14.8).
     BadRequest,
-    /// Unauthorized (RFC 5389 Section 12.1.2).
+    /// The request did not contain the correct credentials. Kept the name
+    /// `Unauthorized` so call sites stay put; RFC 8489 renamed the registered
+    /// reason phrase to `Unauthenticated`, and `reason()` below follows the
+    /// rename.
     Unauthorized,
-    /// Forbidden (RFC 5389 Section 12.1.3).
-    Forbidden,
-    /// Unknown Attribute (RFC 5389 Section 12.1.4).
+    /// The server received a comprehension-required attribute it did not
+    /// understand (RFC 8489 Section 14.8).
     UnknownAttribute,
-    /// Stale Nonce (RFC 8489 Section 9.2.5).
+    /// The NONCE was no longer valid (RFC 8489 Section 14.8).
     StaleNonce,
-    /// Unsupported Address Family (RFC 5389 Section 12.2.6).
-    UnsupportedAddressFamily,
-    /// Role Conflict (RFC 8445 Section 7.2.1.1).
+    /// The Binding request asserted an ICE role that conflicted with the
+    /// server (RFC 8445 Section 16.2).
     RoleConflict,
-    /// Too Many Bindings (RFC 5389 Section 12.2.1).
-    TooManyBindings,
-    /// Too Many Requests (RFC 7675).
-    TooManyRequests,
-    /// Change-Address Unassigned (RFC 5389 Section 12.2.7).
-    ChangeAddress,
-    /// Server Error (RFC 5389 Section 12.2.3).
+    /// The server suffered a temporary error (RFC 8489 Section 14.8).
     ServerError,
 }
 
@@ -40,16 +43,12 @@ impl ErrorCode {
     /// The numeric value carried in the `ERROR-CODE` attribute.
     pub const fn number(self) -> u16 {
         match self {
+            ErrorCode::TryAlternate => 300,
             ErrorCode::BadRequest => 400,
             ErrorCode::Unauthorized => 401,
-            ErrorCode::Forbidden => 403,
-            ErrorCode::UnknownAttribute => 388,
+            ErrorCode::UnknownAttribute => 420,
             ErrorCode::StaleNonce => 438,
-            ErrorCode::UnsupportedAddressFamily => 437,
             ErrorCode::RoleConflict => 487,
-            ErrorCode::TooManyBindings => 486,
-            ErrorCode::TooManyRequests => 488,
-            ErrorCode::ChangeAddress => 386,
             ErrorCode::ServerError => 500,
         }
     }
@@ -57,16 +56,12 @@ impl ErrorCode {
     /// The human-readable reason phrase (RFC 8489 obsoletes `REASON-PHRASE`).
     pub const fn reason(self) -> ReasonPhrase {
         match self {
+            ErrorCode::TryAlternate => ReasonPhrase::TryAlternate,
             ErrorCode::BadRequest => ReasonPhrase::BadRequest,
             ErrorCode::Unauthorized => ReasonPhrase::Unauthorized,
-            ErrorCode::Forbidden => ReasonPhrase::Forbidden,
             ErrorCode::UnknownAttribute => ReasonPhrase::UnknownAttribute,
             ErrorCode::StaleNonce => ReasonPhrase::StaleNonce,
-            ErrorCode::UnsupportedAddressFamily => ReasonPhrase::UnsupportedAddressFamily,
             ErrorCode::RoleConflict => ReasonPhrase::RoleConflict,
-            ErrorCode::TooManyBindings => ReasonPhrase::TooManyBindings,
-            ErrorCode::TooManyRequests => ReasonPhrase::TooManyRequests,
-            ErrorCode::ChangeAddress => ReasonPhrase::ChangeAddress,
             ErrorCode::ServerError => ReasonPhrase::ServerError,
         }
     }
@@ -89,16 +84,12 @@ impl ErrorCode {
 /// Human-readable reason phrases paired with [`ErrorCode::reason`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasonPhrase {
+    TryAlternate,
     BadRequest,
     Unauthorized,
-    Forbidden,
     UnknownAttribute,
     StaleNonce,
-    UnsupportedAddressFamily,
     RoleConflict,
-    TooManyBindings,
-    TooManyRequests,
-    ChangeAddress,
     ServerError,
 }
 
@@ -106,16 +97,12 @@ impl ReasonPhrase {
     /// Canonical wire spelling for the `ERROR-CODE` reason text.
     pub const fn as_str(self) -> &'static str {
         match self {
+            ReasonPhrase::TryAlternate => "Try Alternate",
             ReasonPhrase::BadRequest => "Bad Request",
-            ReasonPhrase::Unauthorized => "Unauthorized",
-            ReasonPhrase::Forbidden => "Forbidden",
+            ReasonPhrase::Unauthorized => "Unauthenticated",
             ReasonPhrase::UnknownAttribute => "Unknown Attribute",
             ReasonPhrase::StaleNonce => "Stale Nonce",
-            ReasonPhrase::UnsupportedAddressFamily => "Unsupported Address Family",
             ReasonPhrase::RoleConflict => "Role Conflict",
-            ReasonPhrase::TooManyBindings => "Too Many Bindings",
-            ReasonPhrase::TooManyRequests => "Too Many Requests",
-            ReasonPhrase::ChangeAddress => "Change-Address Unassigned",
             ReasonPhrase::ServerError => "Server Error",
         }
     }
@@ -127,35 +114,30 @@ mod tests {
 
     /// Every code this crate can decide on. Kept exhaustive: a variant added
     /// later without a table entry breaks this list, not a peer at 3am.
-    fn all_codes() -> [ErrorCode; 11] {
+    fn all_codes() -> [ErrorCode; 7] {
         [
+            ErrorCode::TryAlternate,
             ErrorCode::BadRequest,
             ErrorCode::Unauthorized,
-            ErrorCode::Forbidden,
             ErrorCode::UnknownAttribute,
             ErrorCode::StaleNonce,
-            ErrorCode::UnsupportedAddressFamily,
             ErrorCode::RoleConflict,
-            ErrorCode::TooManyBindings,
-            ErrorCode::TooManyRequests,
-            ErrorCode::ChangeAddress,
             ErrorCode::ServerError,
         ]
     }
 
     #[test]
     fn every_code_is_the_iana_assigned_value() {
+        // Each number is a row of the STUN error-code table: RFC 8489
+        // Section 14.8 for 300/400/401/420/438/500, RFC 8445 Section 16.2 for
+        // 487.
         let expected = [
+            (ErrorCode::TryAlternate, 300),
             (ErrorCode::BadRequest, 400),
             (ErrorCode::Unauthorized, 401),
-            (ErrorCode::Forbidden, 403),
-            (ErrorCode::UnknownAttribute, 388),
+            (ErrorCode::UnknownAttribute, 420),
             (ErrorCode::StaleNonce, 438),
-            (ErrorCode::UnsupportedAddressFamily, 437),
             (ErrorCode::RoleConflict, 487),
-            (ErrorCode::TooManyBindings, 486),
-            (ErrorCode::TooManyRequests, 488),
-            (ErrorCode::ChangeAddress, 386),
             (ErrorCode::ServerError, 500),
         ];
         for (code, number) in expected {
@@ -172,19 +154,14 @@ mod tests {
     #[test]
     fn every_code_pairs_with_a_reason_phrase() {
         let phrases = [
+            ("Try Alternate", ErrorCode::TryAlternate),
             ("Bad Request", ErrorCode::BadRequest),
-            ("Unauthorized", ErrorCode::Unauthorized),
-            ("Forbidden", ErrorCode::Forbidden),
+            // RFC 8489 renamed the 401 phrase; the enum variant keeps the old
+            // name, the wire string does not.
+            ("Unauthenticated", ErrorCode::Unauthorized),
             ("Unknown Attribute", ErrorCode::UnknownAttribute),
             ("Stale Nonce", ErrorCode::StaleNonce),
-            (
-                "Unsupported Address Family",
-                ErrorCode::UnsupportedAddressFamily,
-            ),
             ("Role Conflict", ErrorCode::RoleConflict),
-            ("Too Many Bindings", ErrorCode::TooManyBindings),
-            ("Too Many Requests", ErrorCode::TooManyRequests),
-            ("Change-Address Unassigned", ErrorCode::ChangeAddress),
             ("Server Error", ErrorCode::ServerError),
         ];
         for (phrase, code) in phrases {
@@ -192,17 +169,21 @@ mod tests {
         }
     }
 
+    /// The three numbers the issue asked for. None of them has a row in any
+    /// STUN error-code table, so the table itself is what keeps them out:
+    /// there is no variant to assign them to.
     #[test]
     fn no_unassigned_code_can_be_emitted() {
-        // IANA `stun-parameters` leaves these three unassigned, so they must
-        // not appear in the table at all.
-        let unassigned = [430u16, 390, 370, 0, 200, 300];
+        // 370/390/430 were asked for by the issue; 430 was RFC 3489's
+        // "Stale Credentials". Also probed with the other gaps between the
+        // table rows.
+        let unassigned = [430u16, 390, 370, 0, 200, 386, 388, 403, 437, 440, 486, 488];
         for code in all_codes() {
-            for unassigned in unassigned {
+            for number in unassigned {
                 assert_ne!(
                     code.number(),
-                    unassigned,
-                    "{code:?} must not be assigned {unassigned}"
+                    number,
+                    "{code:?} must not be assigned {number}"
                 );
             }
         }
@@ -210,16 +191,51 @@ mod tests {
 
     #[test]
     fn role_conflict_is_487_not_the_unassigned_430() {
-        // RFC 8445 Section 7.2.1.1: role conflict is 487. The issue asked
-        // for 430; 430 is Unassigned in the IANA registry.
+        // RFC 8445 Section 16.2 registers 487 (Role Conflict). The issue
+        // asked for 430, which appears in no STUN error-code table.
         assert_eq!(ErrorCode::RoleConflict.number(), 487);
         assert_eq!(ErrorCode::RoleConflict.reason().as_str(), "Role Conflict");
+        assert_eq!(ErrorCode::RoleConflict.class(), 4);
+        assert_eq!(ErrorCode::RoleConflict.detail(), 87);
     }
 
     #[test]
     fn stale_nonce_is_438_not_the_unassigned_390() {
-        // RFC 8489 Section 9.2.5: stale nonce is 438.
+        // RFC 8489 Section 14.8 lists 438 (Stale Nonce); 390 has no row.
         assert_eq!(ErrorCode::StaleNonce.number(), 438);
+        assert_eq!(ErrorCode::StaleNonce.reason().as_str(), "Stale Nonce");
+    }
+
+    /// There is no "request already in progress" code to assert on: it has
+    /// no row in any STUN error-code table. The assertion is on the shape of
+    /// the enum — no variant carries 370, and no reason phrase names an
+    /// in-progress request — because the duplicate-request mechanism is not an
+    /// error at all, so it cannot be pinned by a code value.
+    #[test]
+    fn there_is_no_request_already_in_progress_code() {
+        let all = all_codes();
+        assert!(
+            !all.iter().any(|c| c.number() == 370),
+            "370 must not exist; a duplicate request is replayed, not rejected"
+        );
+        assert!(
+            !all.iter().any(|c| c.reason().as_str().contains("Progress")),
+            "no reason phrase may name an in-progress request"
+        );
+        assert!(
+            !all.iter().any(|c| c.number() == 0 || c.number() == 200),
+            "a success response is not an error code"
+        );
+    }
+
+    #[test]
+    fn unknown_attribute_is_420_with_its_reason_phrase() {
+        // RFC 8489 Section 14.8: 420 (Unknown Attribute), with the unknown
+        // attribute carried in an UNKNOWN-ATTRIBUTES attribute.
+        assert_eq!(ErrorCode::UnknownAttribute.number(), 420);
+        assert_eq!(ErrorCode::UnknownAttribute.reason().as_str(), "Unknown Attribute");
+        assert_eq!(ErrorCode::UnknownAttribute.class(), 4);
+        assert_eq!(ErrorCode::UnknownAttribute.detail(), 20);
     }
 
     #[test]
@@ -234,8 +250,10 @@ mod tests {
 
     #[test]
     fn the_error_class_is_always_3_4_or_5() {
-        // RFC 5389 Section 12.1: STUN error classes are 3 (request
-        // unauthorized), 4 (request failed) and 5 (server failed).
+        // RFC 8489 Section 14.8 encodes the class separately and requires it
+        // to be between 3 and 6; every code in the table sits at 3, 4 or 5.
+        // RFC 8489 Section 6.3.4 reads 3xx as "try another server", 4xx as
+        // "the request failed" and 5xx as "the server failed".
         for code in all_codes() {
             assert!(
                 (3..=5).contains(&code.class()),
